@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import vnstock
 
+LOGO_URL_PREFIX = os.getenv("LOGO_URL_PREFIX", "/stock/image")
+
 def _parse_datetime(value: Any) -> Optional[datetime]:
     if value is None:
         return None
@@ -83,6 +85,17 @@ def _df_to_records(df: Any) -> Any:
     if hasattr(df, "to_dict"):
         return df.to_dict(orient="records")
     return df
+def _attach_logo_url(data: Any) -> Any:
+    if not isinstance(data, list):
+        return data
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("ticker") or item.get("symbol") or item.get("code")
+        if not symbol:
+            continue
+        item["logo_url"] = f"{LOGO_URL_PREFIX}/{str(symbol).upper()}"
+    return data
 def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout_s: int = 15) -> Dict[str, Any]:
     headers = {
         "accept": "application/json, text/plain, */*",
@@ -305,7 +318,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # =========================
         if cmd in ("listing_companies", "list"):
             df = vnstock.listing_companies()
-            return _response(200, {"success": True, "cmd": cmd, "data": _df_to_records(df)})
+            data = _attach_logo_url(_df_to_records(df))
+            return _response(200, {"success": True, "cmd": cmd, "data": data})
         if cmd == "indices_listing":
             df = vnstock.indices_listing()
             return _response(200, {"success": True, "cmd": cmd, "data": _df_to_records(df)})
@@ -593,10 +607,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
         if cmd == "live_stock_list":
             df = vnstock.live_stock_list()
-            return _response(200, {"success": True, "cmd": cmd, "data": _df_to_records(df)})
+            data = _attach_logo_url(_df_to_records(df))
+            return _response(200, {"success": True, "cmd": cmd, "data": data})
         if cmd == "offline_stock_list":
             df = vnstock.offline_stock_list()
-            return _response(200, {"success": True, "cmd": cmd, "data": _df_to_records(df)})
+            data = _attach_logo_url(_df_to_records(df))
+            return _response(200, {"success": True, "cmd": cmd, "data": data})
         return _response(
             400,
             {

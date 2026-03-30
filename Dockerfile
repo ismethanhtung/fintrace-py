@@ -10,6 +10,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
+    httpx \
     awswrangler \
     pandas \
     requests \
