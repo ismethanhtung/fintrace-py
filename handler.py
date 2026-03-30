@@ -219,14 +219,11 @@ def _enrich_price_board_with_intraday(rows: Any, tickers: list, workers: int = 1
         item["time"] = rt.get("last_time") or item.get("time")
         item["price_source"] = "intraday_1m"
 
-        # Với giá realtime trong phiên, mốc so sánh đúng là close phiên gần nhất (daily_close),
-        # không phải prev_close của bản ghi 1D.
-        ref_close = daily_close if daily_close > 0 else _safe_float(item.get("prev_close"))
-        if ref_close > 0:
-            item["prev_close"] = ref_close
-            change = live_price - ref_close
+        prev_close = _safe_float(item.get("prev_close"))
+        if prev_close > 0:
+            change = live_price - prev_close
             item["change"] = change
-            item["change_percent"] = (change / ref_close) * 100.0
+            item["change_percent"] = (change / prev_close) * 100.0
 
     return rows
 def _aggregate_bars(rows: Any, factor: int) -> Any:
