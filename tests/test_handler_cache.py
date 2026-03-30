@@ -329,6 +329,109 @@ class HandlerCacheTests(unittest.TestCase):
         self.assertEqual(payload["failed_symbols"][0]["symbol"], "KBC")
         self.assertIn("timeout", payload["failed_symbols"][0]["error"].lower())
 
+    def test_technical_endpoint_uses_local_indicator_fallback(self):
+        rows = []
+        for day in range(1, 45):
+            close = 100 + day
+            rows.append(
+                {
+                    "time": f"2026-02-{day:02d} 00:00:00" if day <= 28 else f"2026-03-{(day-28):02d} 00:00:00",
+                    "open": close - 1,
+                    "high": close + 2,
+                    "low": close - 2,
+                    "close": close,
+                    "volume": 1_000_000 + day * 1000,
+                    "ticker": "FPT",
+                }
+            )
+        self.handler.vnstock.stock_historical_data = lambda *args, **kwargs: rows
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "technical", "symbol": "FPT", "indicator": "rsi"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["cmd"], "technical")
+        self.assertTrue(len(payload["data"]) > 0)
+        self.assertIn("rsi14", payload["data"][-1])
+
+    def test_ticker_price_volatility_endpoint_returns_metrics(self):
+        rows = []
+        for day in range(1, 35):
+            close = 50 + (day * 0.7)
+            rows.append(
+                {
+                    "time": f"2026-03-{day:02d} 00:00:00" if day <= 30 else f"2026-04-{(day-30):02d} 00:00:00",
+                    "open": close - 0.3,
+                    "high": close + 1.0,
+                    "low": close - 1.2,
+                    "close": close,
+                    "volume": 500_000 + day * 1000,
+                    "ticker": "SSI",
+                }
+            )
+        self.handler.vnstock.stock_historical_data = lambda *args, **kwargs: rows
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "ticker_price_volatility", "symbol": "SSI", "window": "20"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(payload["success"])
+        self.assertIn("annualized_volatility_pct", payload["data"])
+        self.assertIn("max_drawdown_pct", payload["data"])
+
+    def test_stock_screening_insights_filters_and_sorts(self):
+        self.handler._LISTING_COMPANIES_CACHE = self.handler._CoalescingTTLCache("listing_companies", max_entries=4)
+        self.handler._LISTING_COMPANIES_CACHE.store(
+            "listing_companies",
+            [
+                {"ticker": "AAA", "comGroupCode": "HOSE"},
+                {"ticker": "BBB", "comGroupCode": "HOSE"},
+            ],
+            ttl_s=60,
+            stale_s=60,
+        )
+
+        def fake_history(*args, **kwargs):
+            symbol = kwargs.get("symbol") or (args[0] if args else "AAA")
+            if symbol == "AAA":
+                return [
+                    {"time": "2026-03-28 00:00:00", "open": 10, "high": 12, "low": 9, "close": 10.5, "volume": 1_500_000, "ticker": "AAA"},
+                    {"time": "2026-03-29 00:00:00", "open": 10.6, "high": 12.2, "low": 10.2, "close": 11.8, "volume": 2_000_000, "ticker": "AAA"},
+                ]
+            return [
+                {"time": "2026-03-28 00:00:00", "open": 8, "high": 8.3, "low": 7.7, "close": 8.0, "volume": 100_000, "ticker": "BBB"},
+                {"time": "2026-03-29 00:00:00", "open": 7.9, "high": 8.1, "low": 7.6, "close": 7.7, "volume": 120_000, "ticker": "BBB"},
+            ]
+
+        self.handler.vnstock.stock_historical_data = fake_history
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {
+                "cmd": "stock_screening_insights",
+                "exchange": "HOSE",
+                "limit": "20",
+                "min_volume": "500000",
+                "sort_by": "traded_value",
+            },
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(payload["success"])
+        self.assertGreaterEqual(payload["count"], 1)
+        self.assertEqual(payload["data"][0]["ticker"], "AAA")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,8 @@ PRICE_DEPTH_MAX_SYMBOLS = _env_int("PRICE_DEPTH_MAX_SYMBOLS", 20, 1, 200)
 PRICE_DEPTH_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,5}$")
 PRICE_DEPTH_CALL_TIMEOUT_S = _env_int("PRICE_DEPTH_CALL_TIMEOUT_S", 12, 1, 120)
 PRICE_DEPTH_SLOW_LOG_S = _env_int("PRICE_DEPTH_SLOW_LOG_S", 3, 1, 60)
+PRICE_DEPTH_REQUEST_DEADLINE_S = _env_int("PRICE_DEPTH_REQUEST_DEADLINE_S", 25, 3, 300)
+PRICE_DEPTH_VALIDATE_LISTED_SYMBOLS = _env_bool("PRICE_DEPTH_VALIDATE_LISTED_SYMBOLS", False)
 CHART_CACHE_MAX_ENTRIES = _env_int("CHART_CACHE_MAX_ENTRIES", 1024, 64, 10000)
 CHART_INTRADAY_CACHE_TTL_S = _env_int("CHART_INTRADAY_CACHE_TTL_S", 12, 1, 600)
 CHART_INTRADAY_CACHE_STALE_S = _env_int("CHART_INTRADAY_CACHE_STALE_S", 30, 0, 3600)
@@ -423,6 +425,25 @@ def _normalize_price_depth_rows(raw_payload: Any) -> Any:
     return [], None
 
 
+def _load_price_depth_for_ticker(ticker: str) -> Any:
+    """
+    Try both call signatures of vnstock.price_depth while avoiding duplicated timeout waits.
+    Fallback to list-argument only for signature/type mismatch, not for timeout.
+    """
+    try:
+        return _run_with_timeout(lambda: vnstock.price_depth(ticker), PRICE_DEPTH_CALL_TIMEOUT_S)
+    except TimeoutError:
+        raise
+    except TypeError:
+        return _run_with_timeout(lambda: vnstock.price_depth([ticker]), PRICE_DEPTH_CALL_TIMEOUT_S)
+    except Exception as e:
+        msg = _safe_error_text(e).lower()
+        # Some vnstock versions throw generic exceptions for bad signature.
+        if "argument" in msg or "list" in msg or "iterable" in msg or "typeerror" in msg:
+            return _run_with_timeout(lambda: vnstock.price_depth([ticker]), PRICE_DEPTH_CALL_TIMEOUT_S)
+        raise
+
+
 def _persist_json_cache(file_path: str, value: Any, ttl_s: int, stale_s: int) -> None:
     payload = {
         "stored_at": int(time.time()),
@@ -544,6 +565,592 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _as_float(v: Optional[str], default: float, min_v: float, max_v: float) -> float:
+    if v is None or v == "":
+        return default
+    try:
+        n = float(v)
+    except Exception:
+        return default
+    return max(min_v, min(max_v, n))
+
+
+def _safe_div(numer: float, denom: float, default: float = 0.0) -> float:
+    if denom == 0:
+        return default
+    return numer / denom
+
+
+def _normalize_ohlc_rows(records: Any) -> list:
+    if not isinstance(records, list):
+        return []
+    out = []
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                **row,
+                "close": _safe_float(row.get("close")),
+                "open": _safe_float(row.get("open")),
+                "high": _safe_float(row.get("high")),
+                "low": _safe_float(row.get("low")),
+                "volume": _safe_float(row.get("volume")),
+            }
+        )
+    out.sort(key=lambda x: str(x.get("time") or x.get("date") or ""))
+    return out
+
+
+def _sma(values: list, period: int) -> list:
+    out = [None] * len(values)
+    if period <= 0:
+        return out
+    running = 0.0
+    for i, value in enumerate(values):
+        running += value
+        if i >= period:
+            running -= values[i - period]
+        if i >= period - 1:
+            out[i] = running / float(period)
+    return out
+
+
+def _ema(values: list, period: int) -> list:
+    out = [None] * len(values)
+    if not values or period <= 0:
+        return out
+    alpha = 2.0 / (period + 1.0)
+    ema_val = values[0]
+    out[0] = ema_val
+    for i in range(1, len(values)):
+        ema_val = alpha * values[i] + (1.0 - alpha) * ema_val
+        out[i] = ema_val
+    return out
+
+
+def _rsi(values: list, period: int = 14) -> list:
+    out = [None] * len(values)
+    if len(values) < period + 1:
+        return out
+    gains = [0.0] * len(values)
+    losses = [0.0] * len(values)
+    for i in range(1, len(values)):
+        delta = values[i] - values[i - 1]
+        gains[i] = max(delta, 0.0)
+        losses[i] = max(-delta, 0.0)
+
+    avg_gain = sum(gains[1 : period + 1]) / period
+    avg_loss = sum(losses[1 : period + 1]) / period
+    out[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + _safe_div(avg_gain, avg_loss)))
+
+    for i in range(period + 1, len(values)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+        out[i] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + _safe_div(avg_gain, avg_loss)))
+    return out
+
+
+def _stddev(values: list) -> float:
+    if not values:
+        return 0.0
+    mean = sum(values) / float(len(values))
+    var = sum((v - mean) ** 2 for v in values) / float(len(values))
+    return var ** 0.5
+
+
+def _compute_technical_rows(rows: list) -> list:
+    if not rows:
+        return []
+    closes = [_safe_float(r.get("close")) for r in rows]
+    ma20 = _sma(closes, 20)
+    ma50 = _sma(closes, 50)
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    macd_line = [
+        (e12 - e26) if (e12 is not None and e26 is not None) else None
+        for e12, e26 in zip(ema12, ema26)
+    ]
+    macd_signal = _ema([m if m is not None else 0.0 for m in macd_line], 9)
+    macd_hist = [
+        (m - s) if (m is not None and s is not None) else None
+        for m, s in zip(macd_line, macd_signal)
+    ]
+    rsi14 = _rsi(closes, 14)
+
+    bb_mid = ma20
+    bb_upper = [None] * len(rows)
+    bb_lower = [None] * len(rows)
+    for i in range(len(rows)):
+        if i < 19:
+            continue
+        window = closes[i - 19 : i + 1]
+        sd = _stddev(window)
+        if bb_mid[i] is not None:
+            bb_upper[i] = bb_mid[i] + 2.0 * sd
+            bb_lower[i] = bb_mid[i] - 2.0 * sd
+
+    out = []
+    for i, r in enumerate(rows):
+        out.append(
+            {
+                **r,
+                "ma20": ma20[i],
+                "ma50": ma50[i],
+                "ema12": ema12[i],
+                "ema26": ema26[i],
+                "rsi14": rsi14[i],
+                "macd": macd_line[i],
+                "macd_signal": macd_signal[i],
+                "macd_hist": macd_hist[i],
+                "bb_mid": bb_mid[i],
+                "bb_upper": bb_upper[i],
+                "bb_lower": bb_lower[i],
+            }
+        )
+    return out
+
+
+def _call_vnstock_dynamic(func_name: str, call_specs: list) -> Any:
+    fn = getattr(vnstock, func_name, None)
+    if not callable(fn):
+        raise AttributeError(f"vnstock_missing_method:{func_name}")
+    last_err = None
+    for args, kwargs in call_specs:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"vnstock_call_failed:{func_name}")
+
+
+def _fetch_history_rows(symbol: str, start_date: str, end_date: str, resolution: str = "1D") -> list:
+    call_specs = [
+        ((), {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution, "type": "stock"}),
+        ((symbol, start_date, end_date, resolution, "stock"), {}),
+        ((symbol, start_date, end_date, resolution), {}),
+    ]
+    df = _call_vnstock_dynamic("stock_historical_data", call_specs)
+    return _normalize_ohlc_rows(_df_to_records(df))
+
+
+def _fetch_technical_rows(symbol: str, start_date: str, end_date: str, resolution: str) -> list:
+    call_specs = [
+        ((), {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution, "type": "stock"}),
+        ((), {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution}),
+        ((symbol, start_date, end_date, resolution), {}),
+        ((symbol,), {}),
+    ]
+    try:
+        raw = _call_vnstock_dynamic("technical", call_specs)
+        rows = _normalize_ohlc_rows(_df_to_records(raw))
+        if rows:
+            return rows
+    except Exception:
+        pass
+    base_rows = _fetch_history_rows(symbol, start_date, end_date, resolution=resolution)
+    return _compute_technical_rows(base_rows)
+
+
+def _pick_indicator_columns(indicator: str) -> list:
+    key = str(indicator or "all").strip().lower()
+    if key in ("all", ""):
+        return []
+    if key in ("ma", "moving_average"):
+        return ["ma20", "ma50", "ema12", "ema26"]
+    if key in ("rsi", "rsi14"):
+        return ["rsi14"]
+    if key in ("macd",):
+        return ["macd", "macd_signal", "macd_hist"]
+    if key in ("bollinger", "bb", "bollinger_bands"):
+        return ["bb_mid", "bb_upper", "bb_lower"]
+    return []
+
+
+def _build_technical_payload(cmd: str, symbol: str, start_date: str, end_date: str, resolution: str, indicator: str) -> Dict[str, Any]:
+    rows = _fetch_technical_rows(symbol, start_date, end_date, resolution=resolution)
+    if not rows:
+        return {
+            "success": False,
+            "cmd": cmd,
+            "input": {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution},
+            "data": [],
+            "error": "empty_data",
+        }
+
+    selected_cols = _pick_indicator_columns(indicator)
+    if selected_cols:
+        compact = []
+        for r in rows:
+            payload = {
+                "time": r.get("time") or r.get("date"),
+                "close": r.get("close"),
+            }
+            for key in selected_cols:
+                payload[key] = r.get(key)
+            compact.append(payload)
+        data = compact
+    else:
+        data = rows
+
+    latest = data[-1] if isinstance(data, list) and data else None
+    return {
+        "success": True,
+        "cmd": cmd,
+        "input": {
+            "symbol": symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "resolution": resolution,
+            "indicator": indicator or "all",
+        },
+        "latest": latest,
+        "data": data,
+    }
+
+
+def _build_ticker_price_volatility_payload(cmd: str, symbol: str, start_date: str, end_date: str, resolution: str, window: int) -> Dict[str, Any]:
+    safe_window = max(5, min(120, int(window)))
+    call_specs = [
+        ((), {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution}),
+        ((symbol, start_date, end_date, resolution), {}),
+        ((symbol,), {}),
+    ]
+    try:
+        raw = _call_vnstock_dynamic("ticker_price_volatility", call_specs)
+        raw_data = _df_to_records(raw)
+        if raw_data not in (None, [], {}):
+            return {
+                "success": True,
+                "cmd": cmd,
+                "input": {
+                    "symbol": symbol,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "resolution": resolution,
+                    "window": safe_window,
+                    "source": "vnstock",
+                },
+                "data": raw_data,
+            }
+    except Exception:
+        pass
+
+    rows = _fetch_history_rows(symbol, start_date, end_date, resolution=resolution)
+    if len(rows) < 3:
+        return {
+            "success": False,
+            "cmd": cmd,
+            "input": {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution},
+            "data": {},
+            "error": "insufficient_data",
+        }
+
+    closes = [_safe_float(r.get("close")) for r in rows if _safe_float(r.get("close")) > 0]
+    returns = []
+    for i in range(1, len(closes)):
+        prev_close = closes[i - 1]
+        if prev_close > 0:
+            returns.append((closes[i] - prev_close) / prev_close)
+    tail_returns = returns[-safe_window:] if returns else []
+
+    true_ranges = []
+    for i in range(1, len(rows)):
+        curr = rows[i]
+        prev = rows[i - 1]
+        high = _safe_float(curr.get("high"))
+        low = _safe_float(curr.get("low"))
+        prev_close = _safe_float(prev.get("close"))
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+    tail_tr = true_ranges[-safe_window:] if true_ranges else []
+
+    price_ranges_pct = []
+    for r in rows[-safe_window:]:
+        low = _safe_float(r.get("low"))
+        high = _safe_float(r.get("high"))
+        close = _safe_float(r.get("close"))
+        if close > 0:
+            price_ranges_pct.append(_safe_div(high - low, close) * 100.0)
+
+    peak = closes[0] if closes else 0.0
+    max_dd = 0.0
+    for c in closes:
+        if c > peak:
+            peak = c
+        dd = _safe_div(peak - c, peak, 0.0)
+        if dd > max_dd:
+            max_dd = dd
+
+    daily_std = _stddev(tail_returns)
+    annualized = daily_std * (252.0 ** 0.5)
+    payload = {
+        "sample_size": len(rows),
+        "window": safe_window,
+        "std_return_pct": daily_std * 100.0,
+        "annualized_volatility_pct": annualized * 100.0,
+        "avg_true_range": sum(tail_tr) / float(len(tail_tr)) if tail_tr else 0.0,
+        "avg_range_pct": sum(price_ranges_pct) / float(len(price_ranges_pct)) if price_ranges_pct else 0.0,
+        "max_drawdown_pct": max_dd * 100.0,
+    }
+    return {
+        "success": True,
+        "cmd": cmd,
+        "input": {
+            "symbol": symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "resolution": resolution,
+            "window": safe_window,
+            "source": "local_fallback",
+        },
+        "data": payload,
+    }
+
+
+def _analysis_signal(latest_row: Dict[str, Any], vol: Dict[str, Any]) -> Dict[str, Any]:
+    close = _safe_float(latest_row.get("close"))
+    ma20 = _safe_float(latest_row.get("ma20"))
+    rsi14 = _safe_float(latest_row.get("rsi14"), 50.0)
+    macd = _safe_float(latest_row.get("macd"))
+    macd_signal = _safe_float(latest_row.get("macd_signal"))
+    annual_vol = _safe_float(vol.get("annualized_volatility_pct"))
+
+    trend = "sideway"
+    if close > ma20 > 0:
+        trend = "uptrend"
+    elif ma20 > 0 and close < ma20:
+        trend = "downtrend"
+
+    momentum = "neutral"
+    if rsi14 >= 70:
+        momentum = "overbought"
+    elif rsi14 <= 30:
+        momentum = "oversold"
+    elif macd > macd_signal:
+        momentum = "bullish"
+    elif macd < macd_signal:
+        momentum = "bearish"
+
+    risk = "medium"
+    if annual_vol >= 45:
+        risk = "high"
+    elif annual_vol <= 20:
+        risk = "low"
+
+    action = "hold"
+    if trend == "uptrend" and momentum in ("bullish", "oversold") and risk != "high":
+        action = "buy_watch"
+    elif trend == "downtrend" and momentum in ("bearish", "overbought"):
+        action = "reduce_exposure"
+
+    return {
+        "trend": trend,
+        "momentum": momentum,
+        "risk": risk,
+        "action": action,
+    }
+
+
+def _build_analysis_payload(cmd: str, symbol: str, start_date: str, end_date: str, resolution: str, window: int) -> Dict[str, Any]:
+    call_specs = [
+        ((), {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution}),
+        ((symbol, start_date, end_date, resolution), {}),
+        ((symbol,), {}),
+    ]
+    try:
+        raw = _call_vnstock_dynamic("analysis", call_specs)
+        data = _df_to_records(raw)
+        if data not in (None, [], {}):
+            return {
+                "success": True,
+                "cmd": cmd,
+                "input": {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution, "source": "vnstock"},
+                "data": data,
+            }
+    except Exception:
+        pass
+
+    external_url = os.getenv("ANALYSIS_API_URL", "").strip()
+    if external_url:
+        timeout_s = _env_int("ANALYSIS_API_TIMEOUT_S", 15, 2, 60)
+        try:
+            external = _http_get_json(
+                external_url,
+                params={
+                    "symbol": symbol,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "resolution": resolution,
+                    "window": window,
+                },
+                timeout_s=timeout_s,
+            )
+            return {
+                "success": True,
+                "cmd": cmd,
+                "input": {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution, "source": "external_api"},
+                "data": external,
+            }
+        except Exception as e:
+            LOGGER.warning("External analysis API failed: %s", _safe_error_text(e))
+
+    technical = _build_technical_payload("technical", symbol, start_date, end_date, resolution, "all")
+    vol = _build_ticker_price_volatility_payload("ticker_price_volatility", symbol, start_date, end_date, resolution, window)
+    latest = technical.get("latest") if isinstance(technical, dict) else None
+    vol_data = vol.get("data") if isinstance(vol, dict) and isinstance(vol.get("data"), dict) else {}
+    signal = _analysis_signal(latest or {}, vol_data)
+    return {
+        "success": True,
+        "cmd": cmd,
+        "input": {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution, "source": "local_fallback"},
+        "data": {
+            "signal": signal,
+            "latest_technical": latest or {},
+            "volatility": vol_data,
+        },
+    }
+
+
+def _build_stock_ls_analysis_payload(cmd: str, symbols: list, exchange: str, limit: int, workers: int) -> Dict[str, Any]:
+    safe_limit = max(1, min(2000, int(limit)))
+    safe_workers = max(2, min(64, int(workers)))
+    tickers = _normalize_ticker_list(symbols)
+
+    if not tickers:
+        listing_rows = _get_listing_companies_cached()
+        if exchange in ("HOSE", "HNX", "UPCOM"):
+            listing_rows = [
+                row for row in listing_rows
+                if isinstance(row, dict) and str(row.get("comGroupCode", "")).upper() == exchange
+            ]
+        tickers = _normalize_ticker_list(
+            [str(row.get("ticker", "")).upper() for row in listing_rows if isinstance(row, dict) and row.get("ticker")]
+        )
+
+    tickers = tickers[:safe_limit]
+    if not tickers:
+        return {"success": True, "cmd": cmd, "count": 0, "data": []}
+
+    results = []
+    with ThreadPoolExecutor(max_workers=min(safe_workers, len(tickers))) as ex:
+        fut_map = {ex.submit(_latest_two_daily, t): t for t in tickers}
+        for fut in as_completed(fut_map):
+            ticker = fut_map[fut]
+            try:
+                row = fut.result()
+                if not row:
+                    continue
+                open_p = _safe_float(row.get("open"))
+                close_p = _safe_float(row.get("close"))
+                high_p = _safe_float(row.get("high"))
+                low_p = _safe_float(row.get("low"))
+                spread = max(high_p - low_p, 0.0)
+                buy_sell_force = _safe_div(close_p - open_p, spread, 0.0) if spread > 0 else 0.0
+                traded_value = close_p * _safe_float(row.get("volume"))
+                row["buy_sell_force"] = buy_sell_force
+                row["traded_value"] = traded_value
+                row["money_flow_score"] = (0.65 * _safe_float(row.get("change_percent"))) + (35.0 * buy_sell_force)
+                if row["money_flow_score"] >= 3:
+                    row["money_flow_label"] = "buying_pressure"
+                elif row["money_flow_score"] <= -3:
+                    row["money_flow_label"] = "selling_pressure"
+                else:
+                    row["money_flow_label"] = "neutral"
+                results.append(row)
+            except Exception:
+                LOGGER.debug("stock_ls_analysis skip ticker=%s", ticker)
+                continue
+
+    results.sort(
+        key=lambda x: (
+            _safe_float(x.get("traded_value")),
+            _safe_float(x.get("money_flow_score")),
+        ),
+        reverse=True,
+    )
+    return {
+        "success": True,
+        "cmd": cmd,
+        "input": {"symbols": symbols, "exchange": exchange, "limit": safe_limit, "workers": safe_workers},
+        "count": len(results),
+        "data": results,
+    }
+
+
+def _build_stock_screening_insights_payload(
+    cmd: str,
+    symbols: list,
+    exchange: str,
+    limit: int,
+    workers: int,
+    min_price: float,
+    max_price: float,
+    min_volume: float,
+    min_value: float,
+    min_change: float,
+    max_change: float,
+    sort_by: str,
+) -> Dict[str, Any]:
+    base = _build_stock_ls_analysis_payload("stock_ls_analysis", symbols, exchange, limit, workers)
+    rows = base.get("data") if isinstance(base, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+
+    filtered = []
+    for row in rows:
+        price = _safe_float(row.get("close"))
+        volume = _safe_float(row.get("volume"))
+        traded_value = _safe_float(row.get("traded_value"))
+        change_pct = _safe_float(row.get("change_percent"))
+        if price < min_price:
+            continue
+        if max_price > 0 and price > max_price:
+            continue
+        if volume < min_volume:
+            continue
+        if traded_value < min_value:
+            continue
+        if change_pct < min_change:
+            continue
+        if max_change < 9999 and change_pct > max_change:
+            continue
+        filtered.append(row)
+
+    key = str(sort_by or "money_flow_score").strip().lower()
+    sort_map = {
+        "money_flow_score": lambda r: _safe_float(r.get("money_flow_score")),
+        "change_percent": lambda r: _safe_float(r.get("change_percent")),
+        "volume": lambda r: _safe_float(r.get("volume")),
+        "traded_value": lambda r: _safe_float(r.get("traded_value")),
+    }
+    filtered.sort(key=sort_map.get(key, sort_map["money_flow_score"]), reverse=True)
+    top = filtered[: min(200, len(filtered))]
+
+    return {
+        "success": True,
+        "cmd": cmd,
+        "input": {
+            "symbols": symbols,
+            "exchange": exchange,
+            "limit": limit,
+            "workers": workers,
+            "min_price": min_price,
+            "max_price": max_price,
+            "min_volume": min_volume,
+            "min_value": min_value,
+            "min_change": min_change,
+            "max_change": max_change,
+            "sort_by": key,
+        },
+        "count": len(top),
+        "total_matched": len(filtered),
+        "data": top,
+    }
 
 def _normalize_quote_price(v: Any) -> float:
     """
@@ -1093,6 +1700,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "stock_historical_data",
                         "ohlc_data",
                         "longterm_ohlc_data",
+                        "technical",
+                        "ticker_price_volatility",
+                        "analysis",
+                        "stock_ls_analysis",
+                        "stock_screening_insights",
                         "live_stock_list",
                         "offline_stock_list",
                         "bulk_snapshot",
@@ -1246,13 +1858,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     },
                 )
 
-            listed = _listed_ticker_set()
-            if listed:
-                valid_tickers = [t for t in format_valid if t in listed]
-                invalid_tickers = format_invalid + [t for t in format_valid if t not in listed]
-            else:
-                valid_tickers = format_valid
-                invalid_tickers = format_invalid
+            valid_tickers = format_valid
+            invalid_tickers = format_invalid
+            if PRICE_DEPTH_VALIDATE_LISTED_SYMBOLS:
+                listed = _listed_ticker_set()
+                if listed:
+                    valid_tickers = [t for t in format_valid if t in listed]
+                    invalid_tickers = format_invalid + [t for t in format_valid if t not in listed]
 
             if not valid_tickers:
                 return _response(
@@ -1269,17 +1881,32 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             rows = []
             failed_symbols = []
+            request_started_at = time.time()
             for ticker in valid_tickers:
+                if (time.time() - request_started_at) >= PRICE_DEPTH_REQUEST_DEADLINE_S:
+                    failed_symbols.append(
+                        {
+                            "symbol": ticker,
+                            "error": f"request_deadline_exceeded_{int(PRICE_DEPTH_REQUEST_DEADLINE_S)}s",
+                        }
+                    )
+                    # Mark remaining symbols as skipped due to request-level deadline.
+                    for pending in valid_tickers[valid_tickers.index(ticker) + 1:]:
+                        failed_symbols.append(
+                            {
+                                "symbol": pending,
+                                "error": f"skipped_after_request_deadline_{int(PRICE_DEPTH_REQUEST_DEADLINE_S)}s",
+                            }
+                        )
+                    break
+
                 df = None
                 started_at = time.time()
                 try:
-                    df = _run_with_timeout(lambda: vnstock.price_depth(ticker), PRICE_DEPTH_CALL_TIMEOUT_S)
-                except Exception:
-                    try:
-                        df = _run_with_timeout(lambda: vnstock.price_depth([ticker]), PRICE_DEPTH_CALL_TIMEOUT_S)
-                    except Exception as e:
-                        failed_symbols.append({"symbol": ticker, "error": _safe_error_text(e)})
-                        continue
+                    df = _load_price_depth_for_ticker(ticker)
+                except Exception as e:
+                    failed_symbols.append({"symbol": ticker, "error": _safe_error_text(e)})
+                    continue
 
                 elapsed_s = time.time() - started_at
                 if elapsed_s >= PRICE_DEPTH_SLOW_LOG_S:
@@ -1302,6 +1929,65 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "data": rows,
                 },
             )
+        if cmd == "technical":
+            if not end_date:
+                end_date = datetime.now().strftime("%Y-%m-%d")
+            if not start_date:
+                start_date = (datetime.now() - timedelta(days=max(days, 120))).strftime("%Y-%m-%d")
+            indicator = _param(params, "indicator", "all") or "all"
+            resolution_for_tech = _param(params, "resolution", _param(params, "res", "1D")) or "1D"
+            payload = _build_technical_payload(cmd, symbol, start_date, end_date, resolution_for_tech, indicator)
+            return _response(200, payload)
+        if cmd in ("ticker_price_volatility", "volatility"):
+            if not end_date:
+                end_date = datetime.now().strftime("%Y-%m-%d")
+            if not start_date:
+                start_date = (datetime.now() - timedelta(days=max(days, 180))).strftime("%Y-%m-%d")
+            window = _as_int(_param(params, "window", None), default=20, min_v=5, max_v=120)
+            resolution_for_vol = _param(params, "resolution", _param(params, "res", "1D")) or "1D"
+            payload = _build_ticker_price_volatility_payload(cmd, symbol, start_date, end_date, resolution_for_vol, window)
+            return _response(200, payload)
+        if cmd == "analysis":
+            if not end_date:
+                end_date = datetime.now().strftime("%Y-%m-%d")
+            if not start_date:
+                start_date = (datetime.now() - timedelta(days=max(days, 180))).strftime("%Y-%m-%d")
+            window = _as_int(_param(params, "window", None), default=20, min_v=5, max_v=120)
+            resolution_for_analysis = _param(params, "resolution", _param(params, "res", "1D")) or "1D"
+            payload = _build_analysis_payload(cmd, symbol, start_date, end_date, resolution_for_analysis, window)
+            return _response(200, payload)
+        if cmd == "stock_ls_analysis":
+            exchange = (_param(params, "exchange", "ALL") or "ALL").upper()
+            limit = _as_int(_param(params, "limit", None), default=250, min_v=1, max_v=2000)
+            workers = _as_int(_param(params, "workers", None), default=20, min_v=2, max_v=64)
+            payload = _build_stock_ls_analysis_payload(cmd, symbols_ls or [], exchange, limit, workers)
+            return _response(200, payload)
+        if cmd == "stock_screening_insights":
+            exchange = (_param(params, "exchange", "ALL") or "ALL").upper()
+            limit = _as_int(_param(params, "limit", None), default=300, min_v=1, max_v=2000)
+            workers = _as_int(_param(params, "workers", None), default=24, min_v=2, max_v=64)
+            min_price = _as_float(_param(params, "min_price", None), default=0.0, min_v=0.0, max_v=10**9)
+            max_price = _as_float(_param(params, "max_price", None), default=0.0, min_v=0.0, max_v=10**9)
+            min_volume = _as_float(_param(params, "min_volume", None), default=0.0, min_v=0.0, max_v=10**12)
+            min_value = _as_float(_param(params, "min_value", None), default=0.0, min_v=0.0, max_v=10**15)
+            min_change = _as_float(_param(params, "min_change", None), default=-9999.0, min_v=-1000.0, max_v=1000.0)
+            max_change = _as_float(_param(params, "max_change", None), default=9999.0, min_v=-1000.0, max_v=1000.0)
+            sort_by = _param(params, "sort_by", "money_flow_score") or "money_flow_score"
+            payload = _build_stock_screening_insights_payload(
+                cmd=cmd,
+                symbols=symbols_ls or [],
+                exchange=exchange,
+                limit=limit,
+                workers=workers,
+                min_price=min_price,
+                max_price=max_price,
+                min_volume=min_volume,
+                min_value=min_value,
+                min_change=min_change,
+                max_change=max_change,
+                sort_by=sort_by,
+            )
+            return _response(200, payload)
         # 2. INTRADAY: Giới hạn page_size để tránh lỗi 502/Timeout
         if cmd in ("stock_intraday_data", "intraday"):
             # Ép safe_size để tránh dữ liệu quá nặng làm treo Lambda
