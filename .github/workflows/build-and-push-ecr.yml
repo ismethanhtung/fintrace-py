@@ -6,7 +6,7 @@ on:
             - "**"
 
 env:
-    AWS_REGION: us-east-1
+    AWS_REGION: ap-southeast-1
     AWS_ROLE_TO_ASSUME: arn:aws:iam::892217934672:role/GitHubAction-ECR-Push-Role
     ECR_REGISTRY: 892217934672.dkr.ecr.ap-southeast-1.amazonaws.com
     ECR_REPOSITORY: ismethanhtung/fintrace-py
