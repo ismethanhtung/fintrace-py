@@ -65,6 +65,7 @@ def _load_handler():
 class HandlerCacheTests(unittest.TestCase):
     def setUp(self):
         self.handler = _load_handler()
+        self.handler._CHART_CACHE = self.handler._CoalescingTTLCache("chart", max_entries=16)
 
     def test_coalescing_cache_only_loads_once(self):
         cache = self.handler._CoalescingTTLCache("test", max_entries=16)
@@ -137,6 +138,103 @@ class HandlerCacheTests(unittest.TestCase):
         second_data = json.loads(second["body"])["data"]
         self.assertEqual([row["ticker"] for row in first_data], ["BBB", "AAA"])
         self.assertEqual([row["ticker"] for row in second_data], ["AAA", "BBB"])
+
+    def test_stock_intraday_endpoint_falls_back_to_ohlc_when_primary_empty(self):
+        self.handler.vnstock.stock_intraday_data = lambda **kwargs: []
+        self.handler._tcbs_intraday = lambda symbol, page_size: []
+        self.handler.vnstock.ohlc_data = lambda **kwargs: [
+            {"time": "2026-03-30 09:15:00", "close": 74.4, "ticker": "FPT"}
+        ]
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "stock_intraday_data", "symbol": "FPT", "page_size": "50"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["cmd"], "stock_intraday_data")
+        self.assertEqual(len(payload["data"]), 1)
+        self.assertEqual(payload["data"][0]["ticker"], "FPT")
+
+    def test_stock_intraday_endpoint_falls_back_to_history_when_ohlc_empty(self):
+        self.handler.vnstock.stock_intraday_data = lambda **kwargs: []
+        self.handler._tcbs_intraday = lambda symbol, page_size: []
+        self.handler.vnstock.ohlc_data = lambda **kwargs: []
+        self.handler.vnstock.stock_historical_data = lambda **kwargs: [
+            {"time": "2026-03-30 09:16:00", "close": 74.5, "ticker": "FPT"}
+        ]
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "stock_intraday_data", "symbol": "FPT", "page_size": "50"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["cmd"], "stock_intraday_data")
+        self.assertEqual(len(payload["data"]), 1)
+        self.assertEqual(payload["data"][0]["time"], "2026-03-30 09:16:00")
+
+    def test_price_depth_invalid_symbol_returns_400_without_calling_vnstock(self):
+        calls = {"count": 0}
+
+        def fake_price_depth(*args, **kwargs):
+            calls["count"] += 1
+            return [{"ticker": "AAA"}]
+
+        self.handler.vnstock.price_depth = fake_price_depth
+        self.handler._LISTING_COMPANIES_CACHE = self.handler._CoalescingTTLCache("listing_companies", max_entries=4)
+        self.handler._LISTING_COMPANIES_CACHE.store(
+            "listing_companies",
+            [{"ticker": "FPT", "comGroupCode": "HOSE"}],
+            ttl_s=60,
+            stale_s=60,
+        )
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "price_depth", "symbols": "BTCUSDT"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 400)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error"], "invalid_symbol")
+        self.assertEqual(calls["count"], 0)
+
+    def test_price_depth_symbols_param_uses_only_valid_symbols(self):
+        calls = {"args": []}
+
+        def fake_price_depth(value):
+            calls["args"].append(value)
+            ticker = value[0] if isinstance(value, list) else value
+            return [{"ticker": ticker, "bid": 1}]
+
+        self.handler.vnstock.price_depth = fake_price_depth
+        self.handler._LISTING_COMPANIES_CACHE = self.handler._CoalescingTTLCache("listing_companies", max_entries=4)
+        self.handler._LISTING_COMPANIES_CACHE.store(
+            "listing_companies",
+            [{"ticker": "TIG", "comGroupCode": "HNX"}],
+            ttl_s=60,
+            stale_s=60,
+        )
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "price_depth", "symbols": "TIG,BTCUSDT"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(calls["args"], ["TIG"])
+        self.assertEqual(payload["invalid_symbols"], ["BTCUSDT"])
+        self.assertEqual(payload["data"][0]["ticker"], "TIG")
 
 
 if __name__ == "__main__":

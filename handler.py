@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -50,6 +51,8 @@ PRICE_BOARD_DIRECT_SOURCE_ENABLED = _env_bool("PRICE_BOARD_DIRECT_SOURCE_ENABLED
 INTRADAY_DIRECT_SOURCE_ENABLED = _env_bool("INTRADAY_DIRECT_SOURCE_ENABLED", False)
 PRICE_BOARD_REALTIME_DEFAULT = _env_bool("PRICE_BOARD_REALTIME_DEFAULT", False)
 PRICE_BOARD_REALTIME_MAX_SYMBOLS = _env_int("PRICE_BOARD_REALTIME_MAX_SYMBOLS", 8, 1, 200)
+PRICE_DEPTH_MAX_SYMBOLS = _env_int("PRICE_DEPTH_MAX_SYMBOLS", 20, 1, 200)
+PRICE_DEPTH_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,5}$")
 CHART_CACHE_MAX_ENTRIES = _env_int("CHART_CACHE_MAX_ENTRIES", 1024, 64, 10000)
 CHART_INTRADAY_CACHE_TTL_S = _env_int("CHART_INTRADAY_CACHE_TTL_S", 12, 1, 600)
 CHART_INTRADAY_CACHE_STALE_S = _env_int("CHART_INTRADAY_CACHE_STALE_S", 30, 0, 3600)
@@ -326,6 +329,20 @@ def _normalize_ticker_list(items: Any) -> list:
             continue
         seen.add(ticker)
         out.append(ticker)
+    return out
+
+
+def _listed_ticker_set() -> set:
+    rows = _get_listing_companies_cached()
+    if not isinstance(rows, list):
+        return set()
+    out = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if ticker:
+            out.add(ticker)
     return out
 
 
@@ -896,6 +913,63 @@ def _build_stock_historical_payload(cmd: str, symbol: str, clean_res: str, start
         }
     except Exception as e:
         return {"success": False, "error": f"Lỗi: {str(e)}"}
+
+
+def _load_intraday_rows_with_fallback(symbol: str, page_size: int) -> Any:
+    safe_size = max(1, int(page_size))
+
+    try:
+        df = vnstock.stock_intraday_data(symbol=symbol, page_size=safe_size)
+        rows = _df_to_records(df)
+        if isinstance(rows, list) and rows:
+            return rows[:safe_size]
+    except Exception:
+        pass
+
+    try:
+        rows = _tcbs_intraday(symbol, safe_size)
+        if isinstance(rows, list) and rows:
+            return rows[:safe_size]
+    except Exception:
+        pass
+
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    try:
+        try:
+            df = vnstock.ohlc_data(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                resolution="1",
+                type="stock",
+            )
+        except TypeError:
+            df = vnstock.ohlc_data(symbol=symbol, start_date=start_date, end_date=end_date)
+        rows = _df_to_records(df)
+        if isinstance(rows, list) and rows:
+            return rows[-safe_size:]
+    except Exception:
+        pass
+
+    try:
+        df = vnstock.stock_historical_data(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            resolution="1",
+            type="stock",
+        )
+        rows = _df_to_records(df)
+        if isinstance(rows, list) and rows:
+            return rows[-safe_size:]
+    except Exception:
+        pass
+
+    return []
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if (event.get("httpMethod") == "OPTIONS") or (
         isinstance(event.get("requestContext"), dict)
@@ -1068,12 +1142,70 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except Exception as e:
                 return _response(500, {"success": False, "cmd": cmd, "error": str(e)})
         if cmd == "price_depth":
-            # Một số phiên bản nhận symbol string; một số nhận list. Thử string trước, fallback list.
-            try:
-                df = vnstock.price_depth(symbol)
-            except Exception:
-                df = vnstock.price_depth([symbol])
-            return _response(200, {"success": True, "cmd": cmd, "input": {"symbol": symbol}, "data": _df_to_records(df)})
+            tickers = _normalize_ticker_list(symbols_ls or [symbol])[:PRICE_DEPTH_MAX_SYMBOLS]
+            if not tickers:
+                return _response(
+                    400,
+                    {
+                        "success": False,
+                        "cmd": cmd,
+                        "error": "symbol_required",
+                        "hint": "Dùng symbol=TICKER hoặc symbols=AAA,BBB",
+                    },
+                )
+
+            format_valid = [t for t in tickers if PRICE_DEPTH_SYMBOL_PATTERN.match(t)]
+            format_invalid = [t for t in tickers if not PRICE_DEPTH_SYMBOL_PATTERN.match(t)]
+
+            listed = _listed_ticker_set()
+            if listed:
+                valid_tickers = [t for t in format_valid if t in listed]
+                invalid_tickers = format_invalid + [t for t in format_valid if t not in listed]
+            else:
+                valid_tickers = format_valid
+                invalid_tickers = format_invalid
+
+            if not valid_tickers:
+                return _response(
+                    400,
+                    {
+                        "success": False,
+                        "cmd": cmd,
+                        "error": "invalid_symbol",
+                        "input": {"symbols": tickers},
+                        "invalid_symbols": invalid_tickers,
+                        "hint": "Mã không tồn tại trên HOSE/HNX/UPCOM.",
+                    },
+                )
+
+            rows = []
+            failed_symbols = []
+            for ticker in valid_tickers:
+                try:
+                    df = vnstock.price_depth(ticker)
+                except Exception:
+                    try:
+                        df = vnstock.price_depth([ticker])
+                    except Exception as e:
+                        failed_symbols.append({"symbol": ticker, "error": str(e)})
+                        continue
+                part = _df_to_records(df)
+                if isinstance(part, list):
+                    rows.extend(part)
+                elif part is not None:
+                    rows.append(part)
+
+            return _response(
+                200,
+                {
+                    "success": len(rows) > 0,
+                    "cmd": cmd,
+                    "input": {"symbols": valid_tickers},
+                    "invalid_symbols": invalid_tickers,
+                    "failed_symbols": failed_symbols,
+                    "data": rows,
+                },
+            )
         # 2. INTRADAY: Giới hạn page_size để tránh lỗi 502/Timeout
         if cmd in ("stock_intraday_data", "intraday"):
             # Ép safe_size để tránh dữ liệu quá nặng làm treo Lambda
@@ -1082,15 +1214,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             ttl_s, stale_s = _chart_cache_policy(is_intraday=True)
 
             def _load_intraday_rows():
-                try:
-                    df = vnstock.stock_intraday_data(symbol=symbol, page_size=safe_size)
-                    return _df_to_records(df)
-                except Exception:
-                    # Nếu vnstock lỗi, thử dùng hàm fallback cũ của bạn
-                    try:
-                        return _tcbs_intraday(symbol, safe_size)
-                    except Exception:
-                        return []  # Trả về list rỗng thay vì lỗi 500
+                return _load_intraday_rows_with_fallback(symbol, safe_size)
 
             data = _CHART_CACHE.get_or_load(
                 key=chart_key,
