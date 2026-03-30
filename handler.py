@@ -142,6 +142,90 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+def _normalize_quote_price(v: Any) -> float:
+    """
+    Chuẩn hóa đơn vị giá:
+    - Dữ liệu intraday đôi khi ở đơn vị "nghìn đồng" (vd 26.3),
+      trong khi bảng giá/1D dùng đơn vị VND (vd 26300).
+    """
+    price = _safe_float(v, 0.0)
+    if 0 < price < 1000:
+        return round(price * 1000.0, 2)
+    return price
+
+def _latest_intraday_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        df = vnstock.ohlc_data(
+            symbol=symbol,
+            start_date=today,
+            end_date=today,
+            resolution="1",
+            type="stock",
+        )
+    except Exception:
+        return None
+
+    records = _df_to_records(df)
+    if not isinstance(records, list) or not records:
+        return None
+
+    last = records[-1]
+    price = _normalize_quote_price(last.get("close"))
+    if price <= 0:
+        return None
+    return {
+        "ticker": symbol,
+        "last_price": price,
+        "last_time": last.get("time"),
+    }
+
+def _enrich_price_board_with_intraday(rows: Any, tickers: list, workers: int = 12) -> Any:
+    if not isinstance(rows, list) or not tickers:
+        return rows
+
+    realtime_map: Dict[str, Dict[str, Any]] = {}
+    max_workers = min(max(workers, 2), max(len(tickers), 2))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_map = {ex.submit(_latest_intraday_quote, t): t for t in tickers}
+        for fut in as_completed(fut_map):
+            row = fut.result()
+            if row and row.get("ticker"):
+                realtime_map[str(row["ticker"]).upper()] = row
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        ticker = str(item.get("ticker") or item.get("symbol") or "").upper()
+        if not ticker:
+            continue
+
+        rt = realtime_map.get(ticker)
+        daily_close = _safe_float(item.get("close"))
+        item["daily_close"] = daily_close
+        item["price_source"] = "daily_1D"
+        item["last_price"] = daily_close
+
+        if not rt:
+            continue
+
+        live_price = _safe_float(rt.get("last_price"))
+        if live_price <= 0:
+            continue
+
+        item["close"] = live_price
+        item["last_price"] = live_price
+        item["time"] = rt.get("last_time") or item.get("time")
+        item["price_source"] = "intraday_1m"
+
+        prev_close = _safe_float(item.get("prev_close"))
+        if prev_close > 0:
+            change = live_price - prev_close
+            item["change"] = change
+            item["change_percent"] = (change / prev_close) * 100.0
+
+    return rows
 def _aggregate_bars(rows: Any, factor: int) -> Any:
     records = _df_to_records(rows)
     if not isinstance(records, list) or factor <= 1:
@@ -274,6 +358,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     symbol = _as_symbol(_param(params, "symbol", None))
     symbols_csv = _param(params, "symbols", None)
     symbols_ls = _as_list_csv(symbols_csv)  # ưu tiên list khi gọi bảng giá
+    realtime = (_param(params, "realtime", "1") or "1").lower() in ("1", "true", "yes", "y")
     days = _as_int(_param(params, "days", None), default=30, min_v=1, max_v=3650)
     resolution = _param(params, "resolution", _param(params, "res", "1D")) or "1D"
     start_date = _param(params, "start_date", None)
@@ -354,11 +439,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     data = rows
                 except Exception as e2:
                     data = {"error": "All sources failed", "details": str(e2)}
-            
+
+            # Đồng bộ giá hiển thị với chart: ưu tiên giá intraday mới nhất trong phiên.
+            if realtime and isinstance(data, list):
+                try:
+                    data = _enrich_price_board_with_intraday(data, tickers, workers=12)
+                except Exception:
+                    pass
+
             return _response(200, {
                 "success": True, 
                 "cmd": cmd, 
-                "input": {"tickers": tickers}, 
+                "input": {"tickers": tickers, "realtime": realtime},
                 "data": data
             })
         if cmd == "market_snapshot":
