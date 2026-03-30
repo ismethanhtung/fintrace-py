@@ -1157,6 +1157,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             format_valid = [t for t in tickers if PRICE_DEPTH_SYMBOL_PATTERN.match(t)]
             format_invalid = [t for t in tickers if not PRICE_DEPTH_SYMBOL_PATTERN.match(t)]
 
+            # Chặn ngay symbol sai format (vd BTCUSDT) để tránh đụng các call nặng phía sau.
+            if not format_valid:
+                return _response(
+                    400,
+                    {
+                        "success": False,
+                        "cmd": cmd,
+                        "error": "invalid_symbol",
+                        "input": {"symbols": tickers},
+                        "invalid_symbols": format_invalid,
+                        "hint": "Mã hợp lệ dạng 1-5 ký tự chữ/số (vd: FPT, TIG, VCB).",
+                    },
+                )
+
             listed = _listed_ticker_set()
             if listed:
                 valid_tickers = [t for t in format_valid if t in listed]

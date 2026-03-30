@@ -206,6 +206,21 @@ class HandlerCacheTests(unittest.TestCase):
         self.assertEqual(payload["error"], "invalid_symbol")
         self.assertEqual(calls["count"], 0)
 
+    def test_price_depth_invalid_format_short_circuit_without_listing_lookup(self):
+        self.handler._listed_ticker_set = lambda: (_ for _ in ()).throw(RuntimeError("must not be called"))
+        self.handler.vnstock.price_depth = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("must not be called"))
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "price_depth", "symbol": "BTCUSDT"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 400)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error"], "invalid_symbol")
+
     def test_price_depth_symbols_param_uses_only_valid_symbols(self):
         calls = {"args": []}
 
