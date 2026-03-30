@@ -305,6 +305,30 @@ class HandlerCacheTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["data"][0]["ticker"], "SSI")
 
+    def test_price_depth_timeout_does_not_crash_server(self):
+        self.handler.PRICE_DEPTH_CALL_TIMEOUT_S = 1
+        self.handler.vnstock.price_depth = lambda value: (time.sleep(1.2), [{"ticker": "KBC"}])[1]
+        self.handler._LISTING_COMPANIES_CACHE = self.handler._CoalescingTTLCache("listing_companies", max_entries=4)
+        self.handler._LISTING_COMPANIES_CACHE.store(
+            "listing_companies",
+            [{"ticker": "KBC", "comGroupCode": "HOSE"}],
+            ttl_s=60,
+            stale_s=60,
+        )
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "price_depth", "symbol": "KBC"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["data"], [])
+        self.assertEqual(payload["failed_symbols"][0]["symbol"], "KBC")
+        self.assertIn("timeout", payload["failed_symbols"][0]["error"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

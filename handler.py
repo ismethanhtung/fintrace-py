@@ -4,6 +4,7 @@ import logging
 import re
 import threading
 import time
+import queue
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from collections import OrderedDict
@@ -53,6 +54,8 @@ PRICE_BOARD_REALTIME_DEFAULT = _env_bool("PRICE_BOARD_REALTIME_DEFAULT", False)
 PRICE_BOARD_REALTIME_MAX_SYMBOLS = _env_int("PRICE_BOARD_REALTIME_MAX_SYMBOLS", 8, 1, 200)
 PRICE_DEPTH_MAX_SYMBOLS = _env_int("PRICE_DEPTH_MAX_SYMBOLS", 20, 1, 200)
 PRICE_DEPTH_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,5}$")
+PRICE_DEPTH_CALL_TIMEOUT_S = _env_int("PRICE_DEPTH_CALL_TIMEOUT_S", 12, 1, 120)
+PRICE_DEPTH_SLOW_LOG_S = _env_int("PRICE_DEPTH_SLOW_LOG_S", 3, 1, 60)
 CHART_CACHE_MAX_ENTRIES = _env_int("CHART_CACHE_MAX_ENTRIES", 1024, 64, 10000)
 CHART_INTRADAY_CACHE_TTL_S = _env_int("CHART_INTRADAY_CACHE_TTL_S", 12, 1, 600)
 CHART_INTRADAY_CACHE_STALE_S = _env_int("CHART_INTRADAY_CACHE_STALE_S", 30, 0, 3600)
@@ -314,6 +317,26 @@ def _safe_error_text(err: Any) -> str:
         text = repr(err)
     text = (text or "").strip()
     return text[:500] if text else "unknown_error"
+
+
+def _run_with_timeout(func, timeout_s: int):
+    out_q: "queue.Queue[Any]" = queue.Queue(maxsize=1)
+
+    def _runner():
+        try:
+            out_q.put(("ok", func()))
+        except Exception as e:
+            out_q.put(("err", e))
+
+    th = threading.Thread(target=_runner, daemon=True)
+    th.start()
+    try:
+        status, value = out_q.get(timeout=max(1, int(timeout_s)))
+    except queue.Empty:
+        raise TimeoutError(f"operation_timeout_{int(timeout_s)}s")
+    if status == "err":
+        raise value
+    return value
 def _attach_logo_url(data: Any) -> Any:
     if not isinstance(data, list):
         return data
@@ -1248,14 +1271,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             failed_symbols = []
             for ticker in valid_tickers:
                 df = None
+                started_at = time.time()
                 try:
-                    df = vnstock.price_depth(ticker)
+                    df = _run_with_timeout(lambda: vnstock.price_depth(ticker), PRICE_DEPTH_CALL_TIMEOUT_S)
                 except Exception:
                     try:
-                        df = vnstock.price_depth([ticker])
+                        df = _run_with_timeout(lambda: vnstock.price_depth([ticker]), PRICE_DEPTH_CALL_TIMEOUT_S)
                     except Exception as e:
                         failed_symbols.append({"symbol": ticker, "error": _safe_error_text(e)})
                         continue
+
+                elapsed_s = time.time() - started_at
+                if elapsed_s >= PRICE_DEPTH_SLOW_LOG_S:
+                    LOGGER.warning("Slow price_depth call symbol=%s elapsed=%.2fs", ticker, elapsed_s)
 
                 normalized_rows, normalize_error = _normalize_price_depth_rows(df)
                 if normalize_error:

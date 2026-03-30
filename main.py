@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
+from fastapi.concurrency import run_in_threadpool
 # Hãy chắc chắn bạn đã đổi tên file lambda.py thành handler.py
 from handler import lambda_handler, shutdown_server_runtime, warm_server_caches
 
@@ -32,6 +33,7 @@ DEFAULT_LOGO_CACHE_CONTROL = os.getenv("DEFAULT_LOGO_CACHE_CONTROL", "public, ma
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9._-]{1,20}$")
 GZIP_MINIMUM_SIZE = int(os.getenv("GZIP_MINIMUM_SIZE", "1024"))
 GZIP_COMPRESSLEVEL = int(os.getenv("GZIP_COMPRESSLEVEL", "5"))
+HANDLER_TIMEOUT_SECONDS = float(os.getenv("HANDLER_TIMEOUT_SECONDS", "45"))
 
 _MISSING_LOGO_CACHE = {}
 _MISSING_LOGO_LOCK = threading.Lock()
@@ -170,7 +172,10 @@ async def proxy_lambda(request: Request, path: str):
     
     try:
         # Gọi logic Lambda
-        result = lambda_handler(event, None)
+        result = await asyncio.wait_for(
+            run_in_threadpool(lambda_handler, event, None),
+            timeout=max(1.0, HANDLER_TIMEOUT_SECONDS),
+        )
         
         status_code = result.get("statusCode", 200)
         body_content = result.get("body", "{}")
@@ -187,6 +192,15 @@ async def proxy_lambda(request: Request, path: str):
             content=body_content,
             headers=headers,
             media_type=None,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={
+                "success": False,
+                "error": "gateway_timeout",
+                "detail": f"handler timeout after {max(1.0, HANDLER_TIMEOUT_SECONDS):.0f}s",
+            },
         )
     except Exception as e:
         return JSONResponse(
