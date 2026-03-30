@@ -38,6 +38,8 @@ PRICE_BOARD_REALTIME_TTL_S = _env_int("PRICE_BOARD_REALTIME_TTL_S", 5, 1, 300)
 PRICE_BOARD_REALTIME_STALE_S = _env_int("PRICE_BOARD_REALTIME_STALE_S", 10, 0, 3600)
 LISTING_COMPANIES_CACHE_TTL_S = _env_int("LISTING_COMPANIES_CACHE_TTL_S", 21600, 60, 604800)
 LISTING_COMPANIES_CACHE_STALE_S = _env_int("LISTING_COMPANIES_CACHE_STALE_S", 604800, 60, 2592000)
+LISTING_RESPONSE_CACHE_TTL_S = _env_int("LISTING_RESPONSE_CACHE_TTL_S", 60, 1, 3600)
+LISTING_RESPONSE_CACHE_STALE_S = _env_int("LISTING_RESPONSE_CACHE_STALE_S", 120, 0, 3600)
 CACHE_REFRESH_WORKERS = _env_int("CACHE_REFRESH_WORKERS", 4, 1, 32)
 PRICE_BOARD_INTRADAY_WORKERS = _env_int("PRICE_BOARD_INTRADAY_WORKERS", 8, 2, 32)
 PRICE_BOARD_CACHE_MAX_ENTRIES = _env_int("PRICE_BOARD_CACHE_MAX_ENTRIES", 512, 32, 4096)
@@ -46,6 +48,13 @@ CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/fintrace-cache")
 LISTING_COMPANIES_CACHE_FILE = os.path.join(CACHE_DIR, "listing_companies.json")
 PRICE_BOARD_DIRECT_SOURCE_ENABLED = _env_bool("PRICE_BOARD_DIRECT_SOURCE_ENABLED", False)
 INTRADAY_DIRECT_SOURCE_ENABLED = _env_bool("INTRADAY_DIRECT_SOURCE_ENABLED", False)
+PRICE_BOARD_REALTIME_DEFAULT = _env_bool("PRICE_BOARD_REALTIME_DEFAULT", False)
+PRICE_BOARD_REALTIME_MAX_SYMBOLS = _env_int("PRICE_BOARD_REALTIME_MAX_SYMBOLS", 8, 1, 200)
+CHART_CACHE_MAX_ENTRIES = _env_int("CHART_CACHE_MAX_ENTRIES", 1024, 64, 10000)
+CHART_INTRADAY_CACHE_TTL_S = _env_int("CHART_INTRADAY_CACHE_TTL_S", 12, 1, 600)
+CHART_INTRADAY_CACHE_STALE_S = _env_int("CHART_INTRADAY_CACHE_STALE_S", 30, 0, 3600)
+CHART_DAILY_CACHE_TTL_S = _env_int("CHART_DAILY_CACHE_TTL_S", 300, 5, 86400)
+CHART_DAILY_CACHE_STALE_S = _env_int("CHART_DAILY_CACHE_STALE_S", 1800, 0, 604800)
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -179,6 +188,8 @@ class _CoalescingTTLCache:
 _PRICE_BOARD_CACHE = _CoalescingTTLCache("price_board", max_entries=PRICE_BOARD_CACHE_MAX_ENTRIES)
 _REALTIME_QUOTE_CACHE = _CoalescingTTLCache("realtime_quote", max_entries=REALTIME_CACHE_MAX_ENTRIES)
 _LISTING_COMPANIES_CACHE = _CoalescingTTLCache("listing_companies", max_entries=4)
+_LISTING_RESPONSE_CACHE = _CoalescingTTLCache("listing_response", max_entries=4)
+_CHART_CACHE = _CoalescingTTLCache("chart", max_entries=CHART_CACHE_MAX_ENTRIES)
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
     if value is None:
@@ -198,17 +209,51 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
         return None
 def _now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
 def _response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _response_raw_json(status_code, _json_dumps(payload))
+
+
+def _response_raw_json(status_code: int, body_json: str, extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     return {
         "statusCode": status_code,
-        "headers": {
-            "Content-Type": "application/json; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type,Authorization",
-        },
-        "body": json.dumps(payload, ensure_ascii=False, default=str),
+        "headers": headers,
+        "body": body_json,
     }
+
+
+def _is_intraday_resolution(resolution: str) -> bool:
+    return str(resolution or "").upper() not in ("1D", "1W", "1M", "D", "W", "M")
+
+
+def _chart_cache_policy(is_intraday: bool) -> tuple:
+    if is_intraday:
+        return CHART_INTRADAY_CACHE_TTL_S, CHART_INTRADAY_CACHE_STALE_S
+    return CHART_DAILY_CACHE_TTL_S, CHART_DAILY_CACHE_STALE_S
+
+
+def _chart_cache_key(cmd: str, symbol: str, resolution: str, start_date: str, end_date: str, extra: str = "") -> str:
+    return "|".join([
+        str(cmd or "").lower(),
+        str(symbol or "").upper(),
+        str(resolution or ""),
+        str(start_date or ""),
+        str(end_date or ""),
+        str(extra or ""),
+    ])
 def _get_query_params(event: Dict[str, Any]) -> Dict[str, str]:
     # API Gateway REST (v1): queryStringParameters
     # API Gateway HTTP API (v2): rawQueryString + queryStringParameters or event["queryStringParameters"]
@@ -352,6 +397,15 @@ def _get_listing_companies_cached() -> Any:
 
 
 _seed_cache_from_disk(_LISTING_COMPANIES_CACHE, "listing_companies", LISTING_COMPANIES_CACHE_FILE)
+
+
+def _get_listing_companies_response_json(cmd: str) -> str:
+    return _LISTING_RESPONSE_CACHE.get_or_load(
+        key=f"listing_response:{cmd}",
+        loader=lambda: _json_dumps({"success": True, "cmd": cmd, "data": _get_listing_companies_cached()}),
+        ttl_s=LISTING_RESPONSE_CACHE_TTL_S,
+        stale_s=LISTING_RESPONSE_CACHE_STALE_S,
+    )
 
 
 def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout_s: int = 15) -> Dict[str, Any]:
@@ -642,6 +696,7 @@ def _get_price_board_cached(tickers: list) -> Any:
 def warm_server_caches() -> None:
     try:
         _get_listing_companies_cached()
+        _get_listing_companies_response_json("listing_companies")
     except Exception:
         LOGGER.exception("Warmup failed for listing_companies")
 
@@ -770,6 +825,77 @@ def _latest_two_daily(symbol: str) -> Optional[Dict[str, Any]]:
         "change": change,
         "change_percent": change_percent,
     }
+
+
+def _build_stock_historical_payload(cmd: str, symbol: str, clean_res: str, start_date: str, end_date: str) -> Dict[str, Any]:
+    is_intraday = _is_intraday_resolution(clean_res)
+    try:
+        if is_intraday:
+            try:
+                df = vnstock.ohlc_data(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    resolution=clean_res,
+                    type="stock",
+                )
+            except Exception:
+                if clean_res in ("60", "120", "240"):
+                    base_df = vnstock.ohlc_data(
+                        symbol=symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        resolution="30",
+                        type="stock",
+                    )
+                    factor_map = {"60": 2, "120": 4, "240": 8}
+                    agg = _aggregate_bars(base_df, factor_map.get(clean_res, 1))
+                    return {
+                        "success": True,
+                        "cmd": cmd,
+                        "input": {"symbol": symbol, "res": clean_res, "start": start_date, "fallback": "aggregate_from_30m"},
+                        "data": agg,
+                    }
+                raise
+        else:
+            if clean_res in ("1W", "1M"):
+                base_df = vnstock.stock_historical_data(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    resolution="1D",
+                    type="stock",
+                )
+                agg = _aggregate_daily_to_calendar(base_df, clean_res)
+                return {
+                    "success": True,
+                    "cmd": cmd,
+                    "input": {"symbol": symbol, "res": clean_res, "start": start_date, "fallback": "aggregate_from_1D"},
+                    "data": agg,
+                }
+            df = vnstock.stock_historical_data(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                resolution=clean_res,
+                type="stock",
+            )
+
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return {
+                "success": False,
+                "error": f"Server nguồn (TCBS) từ chối nến {clean_res}. Thử lại với nến 1D hoặc giảm số ngày.",
+                "data": [],
+            }
+
+        return {
+            "success": True,
+            "cmd": cmd,
+            "input": {"symbol": symbol, "res": clean_res, "start": start_date},
+            "data": _df_to_records(df),
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Lỗi: {str(e)}"}
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if (event.get("httpMethod") == "OPTIONS") or (
         isinstance(event.get("requestContext"), dict)
@@ -784,7 +910,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     symbol = _as_symbol(_param(params, "symbol", None))
     symbols_csv = _param(params, "symbols", None)
     symbols_ls = _as_list_csv(symbols_csv)  # ưu tiên list khi gọi bảng giá
-    realtime = (_param(params, "realtime", "1") or "1").lower() in ("1", "true", "yes", "y")
+    realtime_default_raw = "1" if PRICE_BOARD_REALTIME_DEFAULT else "0"
+    realtime = (_param(params, "realtime", realtime_default_raw) or realtime_default_raw).lower() in ("1", "true", "yes", "y")
     days = _as_int(_param(params, "days", None), default=30, min_v=1, max_v=3650)
     resolution = _param(params, "resolution", _param(params, "res", "1D")) or "1D"
     start_date = _param(params, "start_date", None)
@@ -828,8 +955,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # NHÓM 9 — LISTING
         # =========================
         if cmd in ("listing_companies", "list"):
-            data = _get_listing_companies_cached()
-            return _response(200, {"success": True, "cmd": cmd, "data": data})
+            return _response_raw_json(200, _get_listing_companies_response_json(cmd))
         if cmd == "indices_listing":
             df = vnstock.indices_listing()
             return _response(200, {"success": True, "cmd": cmd, "data": _df_to_records(df)})
@@ -846,8 +972,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if isinstance(data, list):
                 data = _order_price_board_rows(data, tickers)
 
+            realtime_applied = realtime and len(tickers) <= PRICE_BOARD_REALTIME_MAX_SYMBOLS
             # Đồng bộ giá hiển thị với chart: ưu tiên giá intraday mới nhất trong phiên.
-            if realtime and isinstance(data, list):
+            if realtime_applied and isinstance(data, list):
                 try:
                     data = _enrich_price_board_with_intraday(data, tickers, workers=PRICE_BOARD_INTRADAY_WORKERS)
                 except Exception:
@@ -856,7 +983,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             return _response(200, {
                 "success": True, 
                 "cmd": cmd, 
-                "input": {"tickers": tickers, "realtime": realtime},
+                "input": {
+                    "tickers": tickers,
+                    "realtime_requested": realtime,
+                    "realtime_applied": realtime_applied,
+                    "realtime_max_symbols": PRICE_BOARD_REALTIME_MAX_SYMBOLS,
+                },
                 "data": data
             })
         if cmd == "market_snapshot":
@@ -945,16 +1077,27 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # 2. INTRADAY: Giới hạn page_size để tránh lỗi 502/Timeout
         if cmd in ("stock_intraday_data", "intraday"):
             # Ép safe_size để tránh dữ liệu quá nặng làm treo Lambda
-            safe_size = min(intraday_page_size, 100) 
-            try:
-                df = vnstock.stock_intraday_data(symbol=symbol, page_size=safe_size)
-                data = _df_to_records(df)
-            except Exception:
-                # Nếu vnstock lỗi, thử dùng hàm fallback cũ của bạn
+            safe_size = min(intraday_page_size, 100)
+            chart_key = _chart_cache_key(cmd, symbol, f"intraday_{safe_size}", "", "", "")
+            ttl_s, stale_s = _chart_cache_policy(is_intraday=True)
+
+            def _load_intraday_rows():
                 try:
-                    data = _tcbs_intraday(symbol, safe_size)
-                except:
-                    data = [] # Trả về list rỗng thay vì lỗi 500
+                    df = vnstock.stock_intraday_data(symbol=symbol, page_size=safe_size)
+                    return _df_to_records(df)
+                except Exception:
+                    # Nếu vnstock lỗi, thử dùng hàm fallback cũ của bạn
+                    try:
+                        return _tcbs_intraday(symbol, safe_size)
+                    except Exception:
+                        return []  # Trả về list rỗng thay vì lỗi 500
+
+            data = _CHART_CACHE.get_or_load(
+                key=chart_key,
+                loader=_load_intraday_rows,
+                ttl_s=ttl_s,
+                stale_s=stale_s,
+            )
                 
             return _response(200, {
                 "success": True, 
@@ -996,78 +1139,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     end_anchor = now
                 start_date = (end_anchor - timedelta(days=safe_days)).strftime("%Y-%m-%d")
 
-            try:
-                # TUYỆT CHIÊU: Nếu là nến giờ/phút, dùng ohlc_data thay vì historical_data
-                if is_intraday:
-                    try:
-                        df = vnstock.ohlc_data(
-                            symbol=symbol, 
-                            start_date=start_date, 
-                            end_date=end_date, 
-                            resolution=clean_res, 
-                            type='stock'
-                        )
-                    except Exception:
-                        # Fallback cho 60/120/240 nếu nguồn không trả trực tiếp:
-                        # kéo 30 phút rồi gộp nến để giữ data "thật" (không mock).
-                        if clean_res in ("60", "120", "240"):
-                            base_df = vnstock.ohlc_data(
-                                symbol=symbol,
-                                start_date=start_date,
-                                end_date=end_date,
-                                resolution="30",
-                                type="stock",
-                            )
-                            factor_map = {"60": 2, "120": 4, "240": 8}
-                            agg = _aggregate_bars(base_df, factor_map.get(clean_res, 1))
-                            return _response(200, {
-                                "success": True,
-                                "cmd": cmd,
-                                "input": {"symbol": symbol, "res": clean_res, "start": start_date, "fallback": "aggregate_from_30m"},
-                                "data": agg,
-                            })
-                        raise
-                else:
-                    # 1W/1M từ nguồn thường thiếu/đứt dữ liệu, nên lấy 1D rồi aggregate lịch.
-                    if clean_res in ("1W", "1M"):
-                        base_df = vnstock.stock_historical_data(
-                            symbol=symbol,
-                            start_date=start_date,
-                            end_date=end_date,
-                            resolution="1D",
-                            type="stock",
-                        )
-                        agg = _aggregate_daily_to_calendar(base_df, clean_res)
-                        return _response(200, {
-                            "success": True,
-                            "cmd": cmd,
-                            "input": {"symbol": symbol, "res": clean_res, "start": start_date, "fallback": "aggregate_from_1D"},
-                            "data": agg,
-                        })
-                    df = vnstock.stock_historical_data(
-                        symbol=symbol,
-                        start_date=start_date,
-                        end_date=end_date,
-                        resolution=clean_res,
-                        type="stock"
-                    )
-                
-                if df is None or (hasattr(df, "empty") and df.empty):
-                    return _response(200, {
-                        "success": False, 
-                        "error": f"Server nguồn (TCBS) từ chối nến {clean_res}. Thử lại với nến 1D hoặc giảm số ngày.",
-                        "data": []
-                    })
-                
-                return _response(200, {
-                    "success": True,
-                    "cmd": cmd,
-                    "input": {"symbol": symbol, "res": clean_res, "start": start_date},
-                    "data": _df_to_records(df),
-                })
-
-            except Exception as e:
-                return _response(200, {"success": False, "error": f"Lỗi: {str(e)}"})
+            chart_key = _chart_cache_key(cmd, symbol, clean_res, start_date, end_date, "history")
+            ttl_s, stale_s = _chart_cache_policy(is_intraday=is_intraday)
+            payload = _CHART_CACHE.get_or_load(
+                key=chart_key,
+                loader=lambda: _build_stock_historical_payload(cmd, symbol, clean_res, start_date, end_date),
+                ttl_s=ttl_s,
+                stale_s=stale_s,
+            )
+            return _response(200, payload)
         if cmd == "ohlc_data":
             # vnstock.ohlc_data signature có thể khác nhau theo version;
             # support các param phổ biến: symbol, start_date, end_date, resolution/type (nếu có)
@@ -1075,48 +1155,74 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 end_date = datetime.now().strftime("%Y-%m-%d")
             if not start_date:
                 start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-            try:
-                df = vnstock.ohlc_data(symbol=symbol, start_date=start_date, end_date=end_date, resolution=resolution, type="stock")
-            except TypeError:
-                df = vnstock.ohlc_data(symbol=symbol, start_date=start_date, end_date=end_date)
-            return _response(
-                200,
-                {
+            is_intraday = _is_intraday_resolution(resolution)
+            chart_key = _chart_cache_key(cmd, symbol, resolution, start_date, end_date, "ohlc")
+            ttl_s, stale_s = _chart_cache_policy(is_intraday=is_intraday)
+
+            def _load_ohlc_payload():
+                try:
+                    df = vnstock.ohlc_data(
+                        symbol=symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        resolution=resolution,
+                        type="stock",
+                    )
+                except TypeError:
+                    df = vnstock.ohlc_data(symbol=symbol, start_date=start_date, end_date=end_date)
+                return {
                     "success": True,
                     "cmd": cmd,
                     "input": {"symbol": symbol, "start_date": start_date, "end_date": end_date, "resolution": resolution},
                     "data": _df_to_records(df),
-                },
+                }
+
+            payload = _CHART_CACHE.get_or_load(
+                key=chart_key,
+                loader=_load_ohlc_payload,
+                ttl_s=ttl_s,
+                stale_s=stale_s,
             )
+            return _response(200, payload)
         if cmd == "longterm_ohlc_data":
-            data = None
-            try:
-                # Lấy 5 năm dữ liệu bằng hàm historical (rất ổn định)
-                curr_end = datetime.now().strftime("%Y-%m-%d")
-                curr_start = (datetime.now() - timedelta(days=365*5)).strftime("%Y-%m-%d")
-                
-                df = vnstock.stock_historical_data(
-                    symbol=symbol, 
-                    start_date=curr_start, 
-                    end_date=curr_end, 
-                    resolution="1D", 
-                    type="stock"
-                )
-                data = _df_to_records(df)
-            except Exception as e:
-                # Nếu fail, thử nốt hàm nguyên bản hoặc trả về lỗi sạch sẽ
+            chart_key = _chart_cache_key(cmd, symbol, "1D", "", "", "longterm")
+
+            def _load_longterm_payload():
+                data = None
                 try:
-                    df = vnstock.longterm_ohlc_data(symbol=symbol)
+                    # Lấy 5 năm dữ liệu bằng hàm historical (rất ổn định)
+                    curr_end = datetime.now().strftime("%Y-%m-%d")
+                    curr_start = (datetime.now() - timedelta(days=365*5)).strftime("%Y-%m-%d")
+
+                    df = vnstock.stock_historical_data(
+                        symbol=symbol,
+                        start_date=curr_start,
+                        end_date=curr_end,
+                        resolution="1D",
+                        type="stock",
+                    )
                     data = _df_to_records(df)
-                except:
-                    data = {"error": f"Longterm data unavailable: {str(e)}"}
-                
-            return _response(200, {
-                "success": True, 
-                "cmd": cmd, 
-                "input": {"symbol": symbol}, 
-                "data": data
-            })
+                except Exception as e:
+                    # Nếu fail, thử nốt hàm nguyên bản hoặc trả về lỗi sạch sẽ
+                    try:
+                        df = vnstock.longterm_ohlc_data(symbol=symbol)
+                        data = _df_to_records(df)
+                    except Exception:
+                        data = {"error": f"Longterm data unavailable: {str(e)}"}
+                return {
+                    "success": True,
+                    "cmd": cmd,
+                    "input": {"symbol": symbol},
+                    "data": data,
+                }
+
+            payload = _CHART_CACHE.get_or_load(
+                key=chart_key,
+                loader=_load_longterm_payload,
+                ttl_s=CHART_DAILY_CACHE_TTL_S,
+                stale_s=CHART_DAILY_CACHE_STALE_S,
+            )
+            return _response(200, payload)
         if cmd == "live_stock_list":
             df = vnstock.live_stock_list()
             data = _attach_logo_url(_df_to_records(df))
