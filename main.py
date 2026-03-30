@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 
 import httpx
 import uvicorn
@@ -9,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 # Hãy chắc chắn bạn đã đổi tên file lambda.py thành handler.py
-from handler import lambda_handler
+from handler import lambda_handler, shutdown_server_runtime, warm_server_caches
 
 app = FastAPI()
 
@@ -39,6 +40,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def preload_server_caches():
+    threading.Thread(target=warm_server_caches, daemon=True).start()
+
+
+@app.on_event("shutdown")
+async def close_server_runtime():
+    shutdown_server_runtime()
 
 @app.get("/stock/image/{symbol}")
 async def get_cached_stock_logo(symbol: str):

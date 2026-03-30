@@ -1,12 +1,184 @@
 import json
 import os
+import logging
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import vnstock
 
 LOGO_URL_PREFIX = os.getenv("LOGO_URL_PREFIX", "/stock/image")
+LOGGER = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int, min_v: int, max_v: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return max(min_v, min(max_v, value))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+PRICE_BOARD_CACHE_TTL_S = _env_int("PRICE_BOARD_CACHE_TTL_S", 15, 1, 3600)
+PRICE_BOARD_CACHE_STALE_S = _env_int("PRICE_BOARD_CACHE_STALE_S", 45, 0, 86400)
+PRICE_BOARD_REALTIME_TTL_S = _env_int("PRICE_BOARD_REALTIME_TTL_S", 5, 1, 300)
+PRICE_BOARD_REALTIME_STALE_S = _env_int("PRICE_BOARD_REALTIME_STALE_S", 10, 0, 3600)
+LISTING_COMPANIES_CACHE_TTL_S = _env_int("LISTING_COMPANIES_CACHE_TTL_S", 21600, 60, 604800)
+LISTING_COMPANIES_CACHE_STALE_S = _env_int("LISTING_COMPANIES_CACHE_STALE_S", 604800, 60, 2592000)
+CACHE_REFRESH_WORKERS = _env_int("CACHE_REFRESH_WORKERS", 4, 1, 32)
+PRICE_BOARD_INTRADAY_WORKERS = _env_int("PRICE_BOARD_INTRADAY_WORKERS", 8, 2, 32)
+PRICE_BOARD_CACHE_MAX_ENTRIES = _env_int("PRICE_BOARD_CACHE_MAX_ENTRIES", 512, 32, 4096)
+REALTIME_CACHE_MAX_ENTRIES = _env_int("REALTIME_CACHE_MAX_ENTRIES", 4096, 128, 20000)
+CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/fintrace-cache")
+LISTING_COMPANIES_CACHE_FILE = os.path.join(CACHE_DIR, "listing_companies.json")
+PRICE_BOARD_DIRECT_SOURCE_ENABLED = _env_bool("PRICE_BOARD_DIRECT_SOURCE_ENABLED", False)
+INTRADAY_DIRECT_SOURCE_ENABLED = _env_bool("INTRADAY_DIRECT_SOURCE_ENABLED", False)
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+_REQUEST_SESSION = requests.Session()
+_REQUEST_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=64))
+_REQUEST_SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=32))
+_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=CACHE_REFRESH_WORKERS)
+
+
+class _CacheEntry:
+    __slots__ = ("value", "fresh_until", "stale_until", "stored_at")
+
+    def __init__(self, value: Any, fresh_until: float, stale_until: float, stored_at: float):
+        self.value = value
+        self.fresh_until = fresh_until
+        self.stale_until = stale_until
+        self.stored_at = stored_at
+
+
+class _CoalescingTTLCache:
+    def __init__(self, name: str, max_entries: int):
+        self.name = name
+        self.max_entries = max_entries
+        self._lock = threading.RLock()
+        self._data: "OrderedDict[str, _CacheEntry]" = OrderedDict()
+        self._inflight: Dict[str, threading.Event] = {}
+
+    def _prune_locked(self, now: float) -> None:
+        expired_keys = [k for k, v in self._data.items() if v.stale_until <= now]
+        for key in expired_keys:
+            self._data.pop(key, None)
+        while len(self._data) > self.max_entries:
+            self._data.popitem(last=False)
+
+    def _store_locked(self, key: str, value: Any, ttl_s: int, stale_s: int, now: Optional[float] = None) -> _CacheEntry:
+        now = now if now is not None else time.time()
+        entry = _CacheEntry(
+            value=value,
+            fresh_until=now + max(ttl_s, 0),
+            stale_until=now + max(ttl_s + stale_s, ttl_s),
+            stored_at=now,
+        )
+        self._data[key] = entry
+        self._data.move_to_end(key)
+        self._prune_locked(now)
+        return entry
+
+    def store(self, key: str, value: Any, ttl_s: int, stale_s: int) -> None:
+        with self._lock:
+            self._store_locked(key, value, ttl_s, stale_s)
+
+    def seed(self, key: str, value: Any, fresh_remaining_s: int, stale_remaining_s: int) -> None:
+        now = time.time()
+        fresh_until = now + max(fresh_remaining_s, 0)
+        stale_until = now + max(stale_remaining_s, 0)
+        if stale_until <= now:
+            return
+        with self._lock:
+            self._data[key] = _CacheEntry(value=value, fresh_until=fresh_until, stale_until=stale_until, stored_at=now)
+            self._data.move_to_end(key)
+            self._prune_locked(now)
+
+    def _do_refresh(self, key: str, loader, ttl_s: int, stale_s: int) -> None:
+        try:
+            value = loader()
+        except Exception:
+            LOGGER.exception("Background refresh failed for cache=%s key=%s", self.name, key)
+        else:
+            with self._lock:
+                self._store_locked(key, value, ttl_s, stale_s)
+        finally:
+            with self._lock:
+                event = self._inflight.pop(key, None)
+                if event:
+                    event.set()
+
+    def get_or_load(self, key: str, loader, ttl_s: int, stale_s: int = 0) -> Any:
+        stale_entry = None
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            entry = self._data.get(key)
+            if entry:
+                self._data.move_to_end(key)
+                if entry.fresh_until > now:
+                    return entry.value
+                if entry.stale_until > now:
+                    stale_entry = entry
+                    if key not in self._inflight:
+                        event = threading.Event()
+                        self._inflight[key] = event
+                        _REFRESH_EXECUTOR.submit(self._do_refresh, key, loader, ttl_s, stale_s)
+                    return entry.value
+
+            event = self._inflight.get(key)
+            if event is None:
+                event = threading.Event()
+                self._inflight[key] = event
+                owner = True
+            else:
+                owner = False
+
+        if owner:
+            try:
+                value = loader()
+                with self._lock:
+                    self._store_locked(key, value, ttl_s, stale_s)
+                return value
+            except Exception:
+                if stale_entry:
+                    LOGGER.exception("Serving stale cache after refresh failure: cache=%s key=%s", self.name, key)
+                    return stale_entry.value
+                raise
+            finally:
+                with self._lock:
+                    waiter = self._inflight.pop(key, None)
+                    if waiter:
+                        waiter.set()
+
+        event.wait(timeout=30)
+        with self._lock:
+            entry = self._data.get(key)
+            if entry:
+                self._data.move_to_end(key)
+                return entry.value
+        if stale_entry:
+            return stale_entry.value
+        raise TimeoutError(f"cache load timeout: {self.name}:{key}")
+
+
+_PRICE_BOARD_CACHE = _CoalescingTTLCache("price_board", max_entries=PRICE_BOARD_CACHE_MAX_ENTRIES)
+_REALTIME_QUOTE_CACHE = _CoalescingTTLCache("realtime_quote", max_entries=REALTIME_CACHE_MAX_ENTRIES)
+_LISTING_COMPANIES_CACHE = _CoalescingTTLCache("listing_companies", max_entries=4)
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
     if value is None:
@@ -96,6 +268,92 @@ def _attach_logo_url(data: Any) -> Any:
             continue
         item["logo_url"] = f"{LOGO_URL_PREFIX}/{str(symbol).upper()}"
     return data
+
+
+def _normalize_ticker_list(items: Any) -> list:
+    if not items:
+        return []
+    seen = set()
+    out = []
+    for raw in items:
+        ticker = str(raw or "").strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        out.append(ticker)
+    return out
+
+
+def _price_board_cache_key(tickers: list) -> str:
+    return ",".join(sorted(_normalize_ticker_list(tickers)))
+
+
+def _persist_json_cache(file_path: str, value: Any, ttl_s: int, stale_s: int) -> None:
+    payload = {
+        "stored_at": int(time.time()),
+        "ttl_s": int(ttl_s),
+        "stale_s": int(stale_s),
+        "value": value,
+    }
+    tmp_path = f"{file_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp_path, file_path)
+
+
+def _seed_cache_from_disk(cache: _CoalescingTTLCache, key: str, file_path: str) -> bool:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        LOGGER.exception("Failed to read cache file: %s", file_path)
+        return False
+
+    if not isinstance(payload, dict) or "value" not in payload:
+        return False
+
+    stored_at = int(payload.get("stored_at") or 0)
+    ttl_s = int(payload.get("ttl_s") or 0)
+    stale_s = int(payload.get("stale_s") or 0)
+    age = max(0, int(time.time()) - stored_at)
+    fresh_remaining_s = max(0, ttl_s - age)
+    stale_remaining_s = max(0, ttl_s + stale_s - age)
+    if stale_remaining_s <= 0:
+        return False
+    cache.seed(key=key, value=payload["value"], fresh_remaining_s=fresh_remaining_s, stale_remaining_s=stale_remaining_s)
+    return True
+
+
+def _load_listing_companies_payload() -> Any:
+    df = vnstock.listing_companies()
+    data = _attach_logo_url(_df_to_records(df))
+    try:
+        _persist_json_cache(
+            file_path=LISTING_COMPANIES_CACHE_FILE,
+            value=data,
+            ttl_s=LISTING_COMPANIES_CACHE_TTL_S,
+            stale_s=LISTING_COMPANIES_CACHE_STALE_S,
+        )
+    except Exception:
+        LOGGER.exception("Failed to persist listing_companies cache")
+    return data
+
+
+def _get_listing_companies_cached() -> Any:
+    cache_key = "listing_companies"
+    return _LISTING_COMPANIES_CACHE.get_or_load(
+        key=cache_key,
+        loader=_load_listing_companies_payload,
+        ttl_s=LISTING_COMPANIES_CACHE_TTL_S,
+        stale_s=LISTING_COMPANIES_CACHE_STALE_S,
+    )
+
+
+_seed_cache_from_disk(_LISTING_COMPANIES_CACHE, "listing_companies", LISTING_COMPANIES_CACHE_FILE)
+
+
 def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout_s: int = 15) -> Dict[str, Any]:
     headers = {
         "accept": "application/json, text/plain, */*",
@@ -103,7 +361,7 @@ def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout_s:
         "origin": "https://tcinvest.tcbs.com.vn",
         "referer": "https://tcinvest.tcbs.com.vn/",
     }
-    r = requests.get(url, params=params, headers=headers, timeout=timeout_s)
+    r = _REQUEST_SESSION.get(url, params=params, headers=headers, timeout=timeout_s)
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, dict) else {"_raw": data}
@@ -154,7 +412,63 @@ def _normalize_quote_price(v: Any) -> float:
         return round(price * 1000.0, 2)
     return price
 
-def _latest_intraday_quote(symbol: str) -> Optional[Dict[str, Any]]:
+def _pick_latest_row(rows: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(rows, list) or not rows:
+        return None
+    latest = None
+    latest_dt = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        dt = _parse_datetime(
+            row.get("time")
+            or row.get("tradingTime")
+            or row.get("matchTime")
+            or row.get("date")
+            or row.get("tradingDate")
+        )
+        if latest is None:
+            latest = row
+            latest_dt = dt
+            continue
+        if latest_dt is None or (dt is not None and dt >= latest_dt):
+            latest = row
+            latest_dt = dt
+    return latest
+
+
+def _extract_intraday_quote(symbol: str, rows: Any) -> Optional[Dict[str, Any]]:
+    row = _pick_latest_row(rows)
+    if not row:
+        return None
+
+    price = _normalize_quote_price(
+        row.get("last_price")
+        or row.get("lastPrice")
+        or row.get("matchPrice")
+        or row.get("price")
+        or row.get("close")
+        or row.get("match_price")
+    )
+    if price <= 0:
+        return None
+
+    return {
+        "ticker": symbol,
+        "last_price": price,
+        "last_time": row.get("time") or row.get("tradingTime") or row.get("matchTime") or row.get("date"),
+    }
+
+
+def _latest_intraday_quote_loader(symbol: str) -> Optional[Dict[str, Any]]:
+    if INTRADAY_DIRECT_SOURCE_ENABLED:
+        try:
+            row = _extract_intraday_quote(symbol, _tcbs_intraday(symbol, page_size=5))
+            if row:
+                return row
+        except Exception:
+            pass
+
     today = datetime.now().strftime("%Y-%m-%d")
     try:
         df = vnstock.ohlc_data(
@@ -181,24 +495,30 @@ def _latest_intraday_quote(symbol: str) -> Optional[Dict[str, Any]]:
         "last_time": last.get("time"),
     }
 
-def _enrich_price_board_with_intraday(rows: Any, tickers: list, workers: int = 12) -> Any:
-    if not isinstance(rows, list) or not tickers:
+
+def _latest_intraday_quote_cached(symbol: str) -> Optional[Dict[str, Any]]:
+    cache_key = str(symbol or "").strip().upper()
+    if not cache_key:
+        return None
+    return _REALTIME_QUOTE_CACHE.get_or_load(
+        key=cache_key,
+        loader=lambda: _latest_intraday_quote_loader(cache_key),
+        ttl_s=PRICE_BOARD_REALTIME_TTL_S,
+        stale_s=PRICE_BOARD_REALTIME_STALE_S,
+    )
+
+
+def _merge_price_board_rows(rows: Any, realtime_map: Dict[str, Dict[str, Any]]) -> Any:
+    if not isinstance(rows, list):
         return rows
-
-    realtime_map: Dict[str, Dict[str, Any]] = {}
-    max_workers = min(max(workers, 2), max(len(tickers), 2))
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        fut_map = {ex.submit(_latest_intraday_quote, t): t for t in tickers}
-        for fut in as_completed(fut_map):
-            row = fut.result()
-            if row and row.get("ticker"):
-                realtime_map[str(row["ticker"]).upper()] = row
-
+    merged = []
     for item in rows:
         if not isinstance(item, dict):
             continue
+        item = dict(item)
         ticker = str(item.get("ticker") or item.get("symbol") or "").upper()
         if not ticker:
+            merged.append(item)
             continue
 
         rt = realtime_map.get(ticker)
@@ -208,10 +528,12 @@ def _enrich_price_board_with_intraday(rows: Any, tickers: list, workers: int = 1
         item["last_price"] = daily_close
 
         if not rt:
+            merged.append(item)
             continue
 
         live_price = _safe_float(rt.get("last_price"))
         if live_price <= 0:
+            merged.append(item)
             continue
 
         item["close"] = live_price
@@ -227,8 +549,109 @@ def _enrich_price_board_with_intraday(rows: Any, tickers: list, workers: int = 1
             change = live_price - ref_close
             item["change"] = change
             item["change_percent"] = (change / ref_close) * 100.0
+        merged.append(item)
+    return merged
 
-    return rows
+
+def _enrich_price_board_with_intraday(rows: Any, tickers: list, workers: int = PRICE_BOARD_INTRADAY_WORKERS) -> Any:
+    tickers = _normalize_ticker_list(tickers)
+    if not isinstance(rows, list) or not tickers:
+        return rows
+
+    realtime_map: Dict[str, Dict[str, Any]] = {}
+    max_workers = min(max(workers, 2), max(len(tickers), 2))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_map = {ex.submit(_latest_intraday_quote_cached, t): t for t in tickers}
+        for fut in as_completed(fut_map):
+            try:
+                row = fut.result()
+            except Exception:
+                continue
+            if row and row.get("ticker"):
+                realtime_map[str(row["ticker"]).upper()] = row
+
+    return _merge_price_board_rows(rows, realtime_map)
+
+
+def _order_price_board_rows(rows: Any, tickers: list) -> Any:
+    if not isinstance(rows, list):
+        return rows
+    tickers = _normalize_ticker_list(tickers)
+    if not tickers:
+        return rows
+    by_ticker = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or row.get("symbol") or "").upper()
+        if ticker and ticker not in by_ticker:
+            by_ticker[ticker] = row
+    ordered = [by_ticker[t] for t in tickers if t in by_ticker]
+    used_ids = {id(x) for x in ordered}
+    ordered.extend([row for row in rows if id(row) not in used_ids])
+    return ordered
+
+
+def _load_price_board_payload(tickers: list) -> Any:
+    tickers = _normalize_ticker_list(tickers)
+    if not tickers:
+        return []
+
+    if PRICE_BOARD_DIRECT_SOURCE_ENABLED:
+        direct_rows = None
+        try:
+            direct_rows = _tcbs_price_board(tickers)
+        except Exception:
+            direct_rows = None
+        if isinstance(direct_rows, list) and direct_rows:
+            return _order_price_board_rows(direct_rows, tickers)
+
+    try:
+        df = vnstock.price_board(symbol_ls=tickers if len(tickers) > 1 else tickers[0])
+        rows = _df_to_records(df)
+        if isinstance(rows, list):
+            return _order_price_board_rows(rows, tickers)
+    except Exception:
+        pass
+
+    workers = min(max(len(tickers), 4), 24)
+    rows = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_map = {ex.submit(_latest_two_daily, t): t for t in tickers}
+        for fut in as_completed(fut_map):
+            try:
+                row = fut.result()
+                if row:
+                    rows.append(row)
+            except Exception:
+                continue
+    return _order_price_board_rows(rows, tickers)
+
+
+def _get_price_board_cached(tickers: list) -> Any:
+    normalized = _normalize_ticker_list(tickers)
+    cache_key = _price_board_cache_key(normalized)
+    return _PRICE_BOARD_CACHE.get_or_load(
+        key=cache_key,
+        loader=lambda: _load_price_board_payload(normalized),
+        ttl_s=PRICE_BOARD_CACHE_TTL_S,
+        stale_s=PRICE_BOARD_CACHE_STALE_S,
+    )
+
+
+def warm_server_caches() -> None:
+    try:
+        _get_listing_companies_cached()
+    except Exception:
+        LOGGER.exception("Warmup failed for listing_companies")
+
+
+def shutdown_server_runtime() -> None:
+    try:
+        _REQUEST_SESSION.close()
+    except Exception:
+        pass
+    _REFRESH_EXECUTOR.shutdown(wait=False)
 def _aggregate_bars(rows: Any, factor: int) -> Any:
     records = _df_to_records(rows)
     if not isinstance(records, list) or factor <= 1:
@@ -405,8 +828,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # NHÓM 9 — LISTING
         # =========================
         if cmd in ("listing_companies", "list"):
-            df = vnstock.listing_companies()
-            data = _attach_logo_url(_df_to_records(df))
+            data = _get_listing_companies_cached()
             return _response(200, {"success": True, "cmd": cmd, "data": data})
         if cmd == "indices_listing":
             df = vnstock.indices_listing()
@@ -419,34 +841,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # =========================
 # 1. PRICE BOARD: Bản sửa lỗi triệt để cho Library cũ
         if cmd in ("price_board", "price"):
-            tickers = symbols_ls or [symbol]
-            data = None
-            try:
-                # Thử dùng price_board chuẩn
-                df = vnstock.price_board(symbol_ls=tickers if len(tickers) > 1 else tickers[0])
-                data = _df_to_records(df)
-            except Exception:
-                # FALLBACK: lấy close gần nhất cho từng mã (song song), không chỉ mã đầu tiên.
-                try:
-                    workers = min(max(len(tickers), 4), 24)
-                    rows = []
-                    with ThreadPoolExecutor(max_workers=workers) as ex:
-                        fut_map = {ex.submit(_latest_two_daily, t): t for t in tickers}
-                        for fut in as_completed(fut_map):
-                            try:
-                                row = fut.result()
-                                if row:
-                                    rows.append(row)
-                            except Exception:
-                                continue
-                    data = rows
-                except Exception as e2:
-                    data = {"error": "All sources failed", "details": str(e2)}
+            tickers = _normalize_ticker_list(symbols_ls or [symbol])
+            data = _get_price_board_cached(tickers)
+            if isinstance(data, list):
+                data = _order_price_board_rows(data, tickers)
 
             # Đồng bộ giá hiển thị với chart: ưu tiên giá intraday mới nhất trong phiên.
             if realtime and isinstance(data, list):
                 try:
-                    data = _enrich_price_board_with_intraday(data, tickers, workers=12)
+                    data = _enrich_price_board_with_intraday(data, tickers, workers=PRICE_BOARD_INTRADAY_WORKERS)
                 except Exception:
                     pass
 
@@ -460,12 +863,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             exchange = _param(params, "exchange", "HOSE").upper()
             try:
                 # 1. Lấy danh sách công ty trên sàn đó
-                df_list = vnstock.listing_companies()
-                df_selected = df_list[df_list['comGroupCode'] == exchange]
+                listing_rows = _get_listing_companies_cached()
+                selected_rows = [
+                    row for row in listing_rows
+                    if isinstance(row, dict) and str(row.get("comGroupCode", "")).upper() == exchange
+                ]
                 
                 # 2. Để tránh 'cháy máy', lấy 20 mã tiêu biểu nhất kèm giá (hoặc bạn có thể tăng lên)
                 # Vì lấy lịch sử cho 1600 mã lúc nửa đêm sẽ rất chậm trên Lambda
-                tickers = df_selected['ticker'].tolist()[:50] 
+                tickers = [
+                    str(row.get("ticker", "")).upper()
+                    for row in selected_rows
+                    if row.get("ticker")
+                ][:50]
                 
                 results = []
                 for t in tickers:
@@ -494,10 +904,17 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 if symbols_ls:
                     tickers = symbols_ls[:limit]
                 else:
-                    df_list = vnstock.listing_companies()
+                    listing_rows = _get_listing_companies_cached()
                     if exchange in ("HOSE", "HNX", "UPCOM"):
-                        df_list = df_list[df_list["comGroupCode"] == exchange]
-                    tickers = df_list["ticker"].tolist()[:limit]
+                        listing_rows = [
+                            row for row in listing_rows
+                            if isinstance(row, dict) and str(row.get("comGroupCode", "")).upper() == exchange
+                        ]
+                    tickers = [
+                        str(row.get("ticker", "")).upper()
+                        for row in listing_rows
+                        if isinstance(row, dict) and row.get("ticker")
+                    ][:limit]
                 results = []
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     fut_map = {ex.submit(_latest_two_daily, t): t for t in tickers}
