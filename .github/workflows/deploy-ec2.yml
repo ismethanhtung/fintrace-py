@@ -1,0 +1,79 @@
+name: Deploy to EC2 (Self-Hosted Runner)
+
+on:
+  workflow_run:
+    workflows:
+      - Build and Push Docker image to ECR
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Optional image tag to deploy (default: current commit SHA)
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE_TO_ASSUME: arn:aws:iam::892217934672:role/GitHubAction-ECR-Push-Role
+  ECR_REGISTRY: 892217934672.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: ismethanhtung/fintrace-py
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: fintrace-ec2-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        (
+          github.event.workflow_run.head_branch == 'main' ||
+          github.event.workflow_run.head_branch == 'master'
+        )
+      )
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve image tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            IMAGE_TAG="${{ inputs.image_tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+          else
+            IMAGE_TAG="${{ github.sha }}"
+          fi
+
+          echo "IMAGE_URI=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "Deploying image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+      - name: Pull and deploy with Docker Compose
+        run: |
+          IMAGE_URI="$IMAGE_URI" docker compose -f docker-compose.yml pull
+          IMAGE_URI="$IMAGE_URI" docker compose -f docker-compose.yml up -d --remove-orphans
+
+      - name: Verify compose services
+        run: IMAGE_URI="$IMAGE_URI" docker compose -f docker-compose.yml ps

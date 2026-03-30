@@ -1,0 +1,7 @@
+services:
+  fintrace:
+    image: ${IMAGE_URI:-892217934672.dkr.ecr.us-east-1.amazonaws.com/ismethanhtung/fintrace-py:latest}
+    container_name: fintrace
+    restart: always
+    ports:
+      - "80:8000"
