@@ -251,6 +251,60 @@ class HandlerCacheTests(unittest.TestCase):
         self.assertEqual(payload["invalid_symbols"], ["BTCUSDT"])
         self.assertEqual(payload["data"][0]["ticker"], "TIG")
 
+    def test_price_depth_requires_symbol_or_symbols(self):
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "price_depth"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 400)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error"], "symbol_required")
+
+    def test_price_depth_upstream_invalid_symbol_payload_becomes_failed_symbol(self):
+        self.handler.vnstock.price_depth = lambda value: {
+            "status": 400,
+            "code": "BAD_REQUEST",
+            "message": "invalid symbol",
+        }
+        self.handler._LISTING_COMPANIES_CACHE = self.handler._CoalescingTTLCache("listing_companies", max_entries=4)
+        self.handler._LISTING_COMPANIES_CACHE.store(
+            "listing_companies",
+            [{"ticker": "SSI", "comGroupCode": "HOSE"}],
+            ttl_s=60,
+            stale_s=60,
+        )
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "price_depth", "symbol": "SSI"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["data"], [])
+        self.assertEqual(payload["failed_symbols"][0]["symbol"], "SSI")
+        self.assertIn("invalid symbol", payload["failed_symbols"][0]["error"].lower())
+
+    def test_price_depth_listing_failure_does_not_crash(self):
+        self.handler._get_listing_companies_cached = lambda: (_ for _ in ()).throw(RuntimeError("listing down"))
+        self.handler.vnstock.price_depth = lambda value: [{"ticker": "SSI", "bid": 1}]
+
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {"cmd": "price_depth", "symbol": "SSI"},
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["data"][0]["ticker"], "SSI")
+
 
 if __name__ == "__main__":
     unittest.main()

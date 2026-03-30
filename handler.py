@@ -305,6 +305,15 @@ def _df_to_records(df: Any) -> Any:
     if hasattr(df, "to_dict"):
         return df.to_dict(orient="records")
     return df
+
+
+def _safe_error_text(err: Any) -> str:
+    try:
+        text = str(err)
+    except Exception:
+        text = repr(err)
+    text = (text or "").strip()
+    return text[:500] if text else "unknown_error"
 def _attach_logo_url(data: Any) -> Any:
     if not isinstance(data, list):
         return data
@@ -333,7 +342,11 @@ def _normalize_ticker_list(items: Any) -> list:
 
 
 def _listed_ticker_set() -> set:
-    rows = _get_listing_companies_cached()
+    try:
+        rows = _get_listing_companies_cached()
+    except Exception:
+        LOGGER.exception("Failed to fetch listing_companies while validating symbols")
+        return set()
     if not isinstance(rows, list):
         return set()
     out = set()
@@ -348,6 +361,43 @@ def _listed_ticker_set() -> set:
 
 def _price_board_cache_key(tickers: list) -> str:
     return ",".join(sorted(_normalize_ticker_list(tickers)))
+
+
+def _is_upstream_invalid_symbol_payload(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        code = str(payload.get("code") or "").strip().upper()
+        message = str(payload.get("message") or payload.get("error") or "").strip().lower()
+        if isinstance(status, int) and status >= 400:
+            return "invalid symbol" in message or code == "BAD_REQUEST"
+        if code in ("INVALID_SYMBOL",):
+            return True
+        return "invalid symbol" in message
+    if isinstance(payload, str):
+        low = payload.strip().lower()
+        return "invalid symbol" in low
+    return False
+
+
+def _normalize_price_depth_rows(raw_payload: Any) -> Any:
+    try:
+        part = _df_to_records(raw_payload)
+    except Exception as e:
+        return [], f"normalize_payload_failed: {_safe_error_text(e)}"
+
+    if _is_upstream_invalid_symbol_payload(part):
+        return [], "invalid symbol"
+
+    if isinstance(part, list):
+        clean_rows = [row for row in part if isinstance(row, dict)]
+        if clean_rows:
+            return clean_rows, None
+        return [], None
+    if isinstance(part, dict):
+        if part:
+            return [part], None
+        return [], None
+    return [], None
 
 
 def _persist_json_cache(file_path: str, value: Any, ttl_s: int, stale_s: int) -> None:
@@ -981,7 +1031,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     body = _get_json_body(event) or {}
     params: Dict[str, Any] = {**q, **body}
     cmd = (_param(params, "cmd", "health") or "health").lower()
-    symbol = _as_symbol(_param(params, "symbol", None))
+    raw_symbol = _param(params, "symbol", None)
+    symbol = _as_symbol(raw_symbol)
     symbols_csv = _param(params, "symbols", None)
     symbols_ls = _as_list_csv(symbols_csv)  # ưu tiên list khi gọi bảng giá
     realtime_default_raw = "1" if PRICE_BOARD_REALTIME_DEFAULT else "0"
@@ -1142,7 +1193,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except Exception as e:
                 return _response(500, {"success": False, "cmd": cmd, "error": str(e)})
         if cmd == "price_depth":
-            tickers = _normalize_ticker_list(symbols_ls or [symbol])[:PRICE_DEPTH_MAX_SYMBOLS]
+            requested_tickers = symbols_ls or _as_list_csv(raw_symbol)
+            tickers = _normalize_ticker_list(requested_tickers)[:PRICE_DEPTH_MAX_SYMBOLS]
             if not tickers:
                 return _response(
                     400,
@@ -1195,19 +1247,21 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             rows = []
             failed_symbols = []
             for ticker in valid_tickers:
+                df = None
                 try:
                     df = vnstock.price_depth(ticker)
                 except Exception:
                     try:
                         df = vnstock.price_depth([ticker])
                     except Exception as e:
-                        failed_symbols.append({"symbol": ticker, "error": str(e)})
+                        failed_symbols.append({"symbol": ticker, "error": _safe_error_text(e)})
                         continue
-                part = _df_to_records(df)
-                if isinstance(part, list):
-                    rows.extend(part)
-                elif part is not None:
-                    rows.append(part)
+
+                normalized_rows, normalize_error = _normalize_price_depth_rows(df)
+                if normalize_error:
+                    failed_symbols.append({"symbol": ticker, "error": normalize_error})
+                    continue
+                rows.extend(normalized_rows)
 
             return _response(
                 200,
