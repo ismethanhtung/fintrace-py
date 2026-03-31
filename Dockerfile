@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     httpx \
+    websockets \
     awswrangler \
     pandas \
     requests \

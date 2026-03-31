@@ -11,6 +11,10 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import vnstock
+try:
+    from vndirect_realtime import build_default_collector
+except Exception:
+    build_default_collector = None
 
 LOGO_URL_PREFIX = os.getenv("LOGO_URL_PREFIX", "/stock/image")
 LOGGER = logging.getLogger(__name__)
@@ -63,6 +67,8 @@ CHART_INTRADAY_CACHE_TTL_S = _env_int("CHART_INTRADAY_CACHE_TTL_S", 12, 1, 600)
 CHART_INTRADAY_CACHE_STALE_S = _env_int("CHART_INTRADAY_CACHE_STALE_S", 30, 0, 3600)
 CHART_DAILY_CACHE_TTL_S = _env_int("CHART_DAILY_CACHE_TTL_S", 300, 5, 86400)
 CHART_DAILY_CACHE_STALE_S = _env_int("CHART_DAILY_CACHE_STALE_S", 1800, 0, 604800)
+VNDIRECT_REALTIME_ENABLED = _env_bool("VNDIRECT_REALTIME_ENABLED", True)
+VNDIRECT_SNAPSHOT_DEFAULT_LIMIT = _env_int("VNDIRECT_SNAPSHOT_DEFAULT_LIMIT", 1200, 10, 10000)
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -70,6 +76,8 @@ _REQUEST_SESSION = requests.Session()
 _REQUEST_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=64))
 _REQUEST_SESSION.mount("http://", requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=32))
 _REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=CACHE_REFRESH_WORKERS)
+_VNDIRECT_COLLECTOR_LOCK = threading.Lock()
+_VNDIRECT_COLLECTOR = None
 
 
 class _CacheEntry:
@@ -364,6 +372,46 @@ def _normalize_ticker_list(items: Any) -> list:
         seen.add(ticker)
         out.append(ticker)
     return out
+
+
+def _normalize_feed_list(items: Any) -> list:
+    if not items:
+        return []
+    allowed = {"BA", "SP", "DE", "MI"}
+    seen = set()
+    out = []
+    for raw in items:
+        token = str(raw or "").strip().upper()
+        if not token or token in seen:
+            continue
+        if token not in allowed:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _get_vndirect_collector():
+    global _VNDIRECT_COLLECTOR
+    if not VNDIRECT_REALTIME_ENABLED:
+        return None, "disabled_by_env"
+    if build_default_collector is None:
+        return None, "collector_import_failed"
+    with _VNDIRECT_COLLECTOR_LOCK:
+        if _VNDIRECT_COLLECTOR is None:
+            _VNDIRECT_COLLECTOR = build_default_collector()
+            _VNDIRECT_COLLECTOR.start()
+        return _VNDIRECT_COLLECTOR, None
+
+
+def _vndirect_error_payload(cmd: str, reason: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "cmd": cmd,
+        "api_group": "vndirect_realtime",
+        "api_source": "vndirect_websocket",
+        "error": reason,
+    }
 
 
 def _listed_ticker_set() -> set:
@@ -1396,9 +1444,26 @@ def warm_server_caches() -> None:
         _get_listing_companies_response_json("listing_companies")
     except Exception:
         LOGGER.exception("Warmup failed for listing_companies")
+    try:
+        collector, err = _get_vndirect_collector()
+        if err:
+            LOGGER.warning("VNDIRECT realtime warmup skipped: %s", err)
+        elif collector is not None:
+            collector.start()
+    except Exception:
+        LOGGER.exception("Warmup failed for VNDIRECT realtime collector")
 
 
 def shutdown_server_runtime() -> None:
+    global _VNDIRECT_COLLECTOR
+    with _VNDIRECT_COLLECTOR_LOCK:
+        collector = _VNDIRECT_COLLECTOR
+        _VNDIRECT_COLLECTOR = None
+    if collector is not None:
+        try:
+            collector.stop()
+        except Exception:
+            LOGGER.exception("Failed to stop VNDIRECT realtime collector")
     try:
         _REQUEST_SESSION.close()
     except Exception:
@@ -1708,9 +1773,78 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "live_stock_list",
                         "offline_stock_list",
                         "bulk_snapshot",
+                        "vndirect_realtime_status",
+                        "vndirect_realtime_snapshot",
+                        "vndirect_realtime_subscribe",
                     ],
                 },
             )
+        if cmd == "vndirect_realtime_status":
+            collector, err = _get_vndirect_collector()
+            if err or collector is None:
+                return _response(503, _vndirect_error_payload(cmd, err or "collector_unavailable"))
+            payload = collector.status()
+            payload["cmd"] = cmd
+            return _response(200, payload)
+        if cmd == "vndirect_realtime_subscribe":
+            collector, err = _get_vndirect_collector()
+            if err or collector is None:
+                return _response(503, _vndirect_error_payload(cmd, err or "collector_unavailable"))
+
+            mode = (_param(params, "mode", "add") or "add").strip().lower()
+            eq_symbols = _normalize_ticker_list(symbols_ls or _as_list_csv(raw_symbol) or [])
+            derivative_symbols = _normalize_ticker_list(_as_list_csv(_param(params, "derivative_symbols", "")) or [])
+            market_ids = _as_list_csv(_param(params, "market_ids", "")) or []
+
+            if mode == "set":
+                state = collector.configure(
+                    equity_symbols=eq_symbols,
+                    derivative_symbols=derivative_symbols,
+                    market_ids=market_ids,
+                )
+            else:
+                state = collector.add_symbols(
+                    equity_symbols=eq_symbols,
+                    derivative_symbols=derivative_symbols,
+                    market_ids=market_ids,
+                )
+            return _response(
+                200,
+                {
+                    "success": True,
+                    "cmd": cmd,
+                    "api_group": "vndirect_realtime",
+                    "api_source": "vndirect_websocket",
+                    "input": {
+                        "mode": mode,
+                        "equity_symbols": eq_symbols,
+                        "derivative_symbols": derivative_symbols,
+                        "market_ids": market_ids,
+                    },
+                    "subscription": state,
+                },
+            )
+        if cmd == "vndirect_realtime_snapshot":
+            collector, err = _get_vndirect_collector()
+            if err or collector is None:
+                return _response(503, _vndirect_error_payload(cmd, err or "collector_unavailable"))
+
+            req_symbols = _normalize_ticker_list(symbols_ls or _as_list_csv(raw_symbol) or [])
+            feed_filter = _normalize_feed_list(_as_list_csv(_param(params, "feeds", "")) or [])
+            limit_per_feed = _as_int(_param(params, "limit", None), VNDIRECT_SNAPSHOT_DEFAULT_LIMIT, 10, 10000)
+
+            payload = collector.snapshot(
+                symbols=set(req_symbols) if req_symbols else None,
+                feeds=set(feed_filter) if feed_filter else None,
+                limit_per_feed=limit_per_feed,
+            )
+            payload["cmd"] = cmd
+            payload["input"] = {
+                "symbols": req_symbols,
+                "feeds": feed_filter,
+                "limit": limit_per_feed,
+            }
+            return _response(200, payload)
         # =========================
         # NHÓM 9 — LISTING
         # =========================

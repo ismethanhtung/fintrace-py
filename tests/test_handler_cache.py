@@ -432,6 +432,63 @@ class HandlerCacheTests(unittest.TestCase):
         self.assertGreaterEqual(payload["count"], 1)
         self.assertEqual(payload["data"][0]["ticker"], "AAA")
 
+    def test_vndirect_realtime_status_endpoint_returns_tagged_payload(self):
+        class _DummyCollector:
+            def status(self):
+                return {
+                    "success": True,
+                    "api_group": "vndirect_realtime",
+                    "api_source": "vndirect_websocket",
+                    "connected": True,
+                }
+
+        self.handler._get_vndirect_collector = lambda: (_DummyCollector(), None)
+        event = {"httpMethod": "GET", "queryStringParameters": {"cmd": "vndirect_realtime_status"}}
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["api_group"], "vndirect_realtime")
+        self.assertEqual(payload["api_source"], "vndirect_websocket")
+        self.assertEqual(payload["cmd"], "vndirect_realtime_status")
+
+    def test_vndirect_realtime_snapshot_endpoint_filters_input(self):
+        class _DummyCollector:
+            def snapshot(self, symbols=None, feeds=None, limit_per_feed=0):
+                return {
+                    "success": True,
+                    "api_group": "vndirect_realtime",
+                    "api_source": "vndirect_websocket",
+                    "echo": {
+                        "symbols": sorted(list(symbols or [])),
+                        "feeds": sorted(list(feeds or [])),
+                        "limit_per_feed": limit_per_feed,
+                    },
+                    "data": {"BA": []},
+                }
+
+        self.handler._get_vndirect_collector = lambda: (_DummyCollector(), None)
+        event = {
+            "httpMethod": "GET",
+            "queryStringParameters": {
+                "cmd": "vndirect_realtime_snapshot",
+                "symbols": "fpt,vcb",
+                "feeds": "ba,sp,invalid",
+                "limit": "150",
+            },
+        }
+        response = self.handler.lambda_handler(event, None)
+        payload = json.loads(response["body"])
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["input"]["symbols"], ["FPT", "VCB"])
+        self.assertEqual(payload["input"]["feeds"], ["BA", "SP"])
+        self.assertEqual(payload["echo"]["symbols"], ["FPT", "VCB"])
+        self.assertEqual(payload["echo"]["feeds"], ["BA", "SP"])
+        self.assertEqual(payload["echo"]["limit_per_feed"], 150)
+
 
 if __name__ == "__main__":
     unittest.main()
